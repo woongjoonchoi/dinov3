@@ -309,6 +309,28 @@ dinov3_vit7b16_lc = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_lc', source="local"
 
 ```
 
+### ImageNet train/val evaluation helper
+
+The repository now ships with ``tools/eval_imagenet_accuracy.py`` which runs
+the ViT-7B/16 ImageNet linear classifier on the ImageNet train and validation
+splits.  Example usage:
+
+```bash
+PYTHONPATH=. python tools/eval_imagenet_accuracy.py \
+  --train-dir /path/to/imagenet/train \
+  --val-dir /path/to/imagenet/val \
+  --batch-size 128 --device cuda
+```
+
+For reproducible runs in a container, use the Docker helper:
+
+```bash
+./docker/run_imagenet_eval.sh \
+  --gpus all \
+  -v /path/to/imagenet:/datasets/imagenet:ro \
+  -- --train-dir /datasets/imagenet/train --val-dir /datasets/imagenet/val
+```
+
 ### Pretrained heads - Depther trained on SYNTHMIX dataset
 
 <table style="margin: auto">
