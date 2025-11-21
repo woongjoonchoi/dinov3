@@ -8,3 +8,5 @@ torch
 torchmetrics
 torchvision
 tqdm
+
+pycocotools>=2.0.7
