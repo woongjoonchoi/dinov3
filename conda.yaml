@@ -17,7 +17,8 @@ dependencies:
     - scikit-learn-intelex
     - submitit
     - termcolor
-    - torch 
-    - torchvision 
+    - torch
+    - pycocotools>=2.0.7
+    - torchvision
     - torchmetrics
-    
+
