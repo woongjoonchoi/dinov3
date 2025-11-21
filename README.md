@@ -471,6 +471,33 @@ After the job completes, you will find in the output path directory you specifie
 detector = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_de', source="local", weights=<DETECTOR/CHECKPOINT/URL/OR/PATH>, backbone_weights=<BACKBONE/CHECKPOINT/URL/OR/PATH>)
 ```
 
+#### COCO detection evaluation in Docker
+
+We provide a ready-to-use script and Docker entrypoint for evaluating the pretrained detector on a COCO-style dataset.
+
+Run locally:
+
+```shell
+PYTHONPATH=. python tools/eval_coco_detections.py \
+  --coco-root /path/to/coco \
+  --split val2017 \
+  --device cuda \
+  --batch-size 4 \
+  --max-size 1333
+```
+
+Or build and launch the helper container:
+
+```shell
+bash docker/run_coco_detection_eval.sh \
+  --gpus all \
+  -v /path/to/coco:/datasets/coco:ro \
+  -- \
+  --coco-root /datasets/coco \
+  --split val2017 \
+  --device cuda
+```
+
 ### Pretrained heads - Segmentor trained on ADE20K dataset
 
 <table style="margin: auto">
