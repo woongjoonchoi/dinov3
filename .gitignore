@@ -16,3 +16,11 @@ dist/
 
 # Ignore vscode directory
 .vscode/
+
+# pth
+
+*.pth
+
+#log
+
+*.log

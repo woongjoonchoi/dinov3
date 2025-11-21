@@ -7,3 +7,4 @@ termcolor
 torch
 torchmetrics
 torchvision
+tqdm

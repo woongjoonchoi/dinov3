@@ -23,7 +23,7 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import v2
-
+from tqdm import tqdm
 from dinov3.hub.classifiers import (
     ClassifierWeights,
     dinov3_vit7b16_lc,
@@ -61,7 +61,7 @@ def make_transform(resize_size: int = 256, crop_size: Optional[int] = 224):
 def evaluate_dataset(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> float:
     total_correct = 0
     total_samples = 0
-    for images, targets in loader:
+    for images, targets in tqdm(loader):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         logits = model(images)
@@ -94,13 +94,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--classifier-weights",
         type=str,
-        default=ClassifierWeights.IMAGENET1K.name,
+        # default=ClassifierWeights.IMAGENET1K.name,
+        default = "/app/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth",
         help="Classifier weights enum name, checkpoint path, or URL.",
     )
     parser.add_argument(
         "--backbone-weights",
         type=str,
-        default=BackboneWeights.LVD1689M.name,
+        # default=BackboneWeights.LVD1689M.name,
+        default="/app/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth",
         help="Backbone weights enum name, checkpoint path, or URL.",
     )
     parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
@@ -116,7 +118,42 @@ def main() -> None:
     classifier_weights = _resolve_weights(args.classifier_weights, ClassifierWeights)
     backbone_weights = _resolve_weights(args.backbone_weights, BackboneWeights)
 
-    model = dinov3_vit7b16_lc(weights=classifier_weights, backbone_weights=backbone_weights)
+    # 
+    # model = dinov3_vit7b16_lc(source="local",weights=classifier_weights, backbone_weights=backbone_weights)
+    # model = torch.hub.load("/app", 'dinov3_vit7b16_lc', source="local", weights=classifier_weights, backbone_weights=backbone_weights)
+    # model.to(device)
+    # model.eval()
+
+
+    from dinov3.hub.backbones import dinov3_vit7b16
+    from dinov3.hub.classifiers import _LinearClassifierWrapper
+
+# 1) backbone 생성 (pretrained=False로 빈 모델만 만들기)
+    backbone = dinov3_vit7b16(
+        pretrained=False,    # 여기서 더 이상 URL 안 타게
+        weights=None,        # 중요: weights=None
+        check_hash=False,
+    )
+
+    # 2) backbone local weight 로드
+    backbone_ckpt_path = "/app/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"
+    backbone_state = torch.load(backbone_ckpt_path, map_location="cpu")
+    # 보통 이 ckpt는 "그대로 model.state_dict()" 형태라서:
+    backbone.load_state_dict(backbone_state, strict=True)
+
+    embed_dim = backbone.embed_dim  # 예: 4096 또는 8192
+
+    # 3) linear head 생성 (DINOv3가 쓰는 구조: [cls, mean(patch)] concat → Linear)
+    linear_in_dim = 2 * embed_dim          # wrapper에서 concat 하니까 2배
+    linear_head = torch.nn.Linear(linear_in_dim, 1000)  # ImageNet-1k
+
+    # 4) linear head local weight 로드
+    head_ckpt_path = "/app/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth"
+    head_state = torch.load(head_ckpt_path, map_location="cpu")
+    linear_head.load_state_dict(head_state, strict=True)
+
+    # 5) DINOv3 전용 wrapper로 합치기
+    model = _LinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
     model.to(device)
     model.eval()
 

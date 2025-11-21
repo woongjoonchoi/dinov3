@@ -11,7 +11,27 @@ usage() {
 Usage: docker/run_imagenet_eval.sh [docker-run-args ...] -- [evaluation-script-args]
 
 Examples:
+bash  docker/run_imagenet_eval.sh  \
+  --gpus all \
+  -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
+  -- \
+  --train-dir /datasets/imagenet/train \
+  --val-dir /datasets/imagenet/val \
+  --device cuda
+
+
+bash  docker/run_imagenet_eval.sh  \
+  --gpus all \
+    --shm-size=24g \
+  -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
+  -- \
+    --batch-size 1024 \
+  --val-dir /datasets/imagenet/val \
+  --device cuda
+
   docker/run_imagenet_eval.sh -- \
+    --gpus all \ 
+    -v /path/to/imagenet:/datasets/imagenet:ro \
       --train-dir /datasets/imagenet/train --val-dir /datasets/imagenet/val --device cuda
 
 All arguments after the first "--" are forwarded to tools/eval_imagenet_accuracy.py.
@@ -51,6 +71,10 @@ if [[ ${#eval_args[@]} -eq 0 ]]; then
     usage
     exit 1
 fi
+
+echo "docker_args: ${docker_args[@]}"
+echo "eval_args  : ${eval_args[@]}"
+
 
 docker build -f "${REPO_ROOT}/docker/imagenet_eval.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
 
