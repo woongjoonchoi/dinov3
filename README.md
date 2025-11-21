@@ -309,6 +309,42 @@ dinov3_vit7b16_lc = torch.hub.load(REPO_DIR, 'dinov3_vit7b16_lc', source="local"
 
 ```
 
+### ImageNet train/val evaluation helper
+
+The repository now ships with ``tools/eval_imagenet_accuracy.py`` which runs
+the ViT-7B/16 ImageNet linear classifier on the ImageNet train and validation
+splits.  Example usage:
+
+```bash
+PYTHONPATH=. python tools/eval_imagenet_accuracy.py \
+  --train-dir /path/to/imagenet/train \
+  --val-dir /path/to/imagenet/val \
+  --batch-size 128 --device cuda
+```
+
+By default the script pulls the released ImageNet classifier and backbone
+weights via their enum names (`ClassifierWeights.IMAGENET1K` and
+`BackboneWeights.LVD1689M`).  You can override either reference by pointing the
+`--classifier-weights` or `--backbone-weights` flags to **either** another enum
+name (e.g. `IMAGENET1K_V2`) **or** to the local filesystem path / URL of a
+checkpoint you previously downloaded:
+
+```bash
+PYTHONPATH=. python tools/eval_imagenet_accuracy.py \
+  --train-dir /path/to/imagenet/train \
+  --classifier-weights /checkpoints/dinov3_vit7b16_lc.pth \
+  --backbone-weights /checkpoints/dinov3_vit7b16_backbone.pth
+```
+
+For reproducible runs in a container, use the Docker helper:
+
+```bash
+./docker/run_imagenet_eval.sh \
+  --gpus all \
+  -v /path/to/imagenet:/datasets/imagenet:ro \
+  -- --train-dir /datasets/imagenet/train --val-dir /datasets/imagenet/val
+```
+
 ### Pretrained heads - Depther trained on SYNTHMIX dataset
 
 <table style="margin: auto">
