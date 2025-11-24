@@ -14,6 +14,7 @@ Examples:
 bash  docker/run_imagenet_eval_ddp.sh  \
   --gpus all \
   -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
+    -v ~/dinov3_pth:/dinov3_pth:ro \
   -- \
   --train-dir /datasets/imagenet/train \
   --val-dir /datasets/imagenet/val \
@@ -24,11 +25,24 @@ bash  docker/run_imagenet_eval_ddp.sh  \
   --gpus all \
     --shm-size=120g \
   -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
+      -v ~/dinov3_pth:/dinov3_pth:ro \
   -- \
     --batch-size 1024 \
   --val-dir /datasets/imagenet/val \
   --device cuda \
   --distributed 
+
+bash  docker/run_imagenet_eval_ddp.sh  \
+  --gpus all \
+    --shm-size=120g \
+  -v ~/imagenet/imagenet-1k:/datasets/imagenet:ro \
+      -v ~/dinov3_pth:/dinov3_pth:ro \
+  -- \
+    --batch-size 1024 \
+  --val-dir /datasets/imagenet/val \
+  --device cuda \
+  --distributed 
+
 
   docker/run_imagenet_eval_ddp.sh -- \
     --gpus all \ 

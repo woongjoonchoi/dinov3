@@ -24,6 +24,7 @@ bash  docker/run_imagenet_eval.sh  \
   --gpus all \
     --shm-size=24g \
   -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
+
   -- \
     --batch-size 1024 \
   --val-dir /datasets/imagenet/val \

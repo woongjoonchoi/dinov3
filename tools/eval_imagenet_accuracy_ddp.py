@@ -169,7 +169,8 @@ def main() -> None:
     )
 
     # 2) backbone local weight 로드
-    backbone_ckpt_path = "/app/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"
+    # backbone_ckpt_path = "/app/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"
+    backbone_ckpt_path = "/dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"
     backbone_state = torch.load(backbone_ckpt_path, map_location="cpu")
     # 보통 이 ckpt는 "그대로 model.state_dict()" 형태라서:
     backbone.load_state_dict(backbone_state, strict=True)
@@ -181,7 +182,8 @@ def main() -> None:
     linear_head = torch.nn.Linear(linear_in_dim, 1000)  # ImageNet-1k
 
     # 4) linear head local weight 로드
-    head_ckpt_path = "/app/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth"
+    # head_ckpt_path = "/app/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth"
+    head_ckpt_path = "/dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth"
     head_state = torch.load(head_ckpt_path, map_location="cpu")
     linear_head.load_state_dict(head_state, strict=True)
 
