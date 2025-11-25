@@ -18,6 +18,13 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from dinov3.hub.classifiers import ClassifierWeights
 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torchvision import datasets
+from torchvision.transforms import v2
+
+
 
 @torch.inference_mode()
 def _evaluate_head(
@@ -175,6 +182,22 @@ def _load_activation_dataset(path: pathlib.Path) -> tuple[Dataset, bool]:
 
 def main() -> None:
     args = _parse_args()
+
+    if args.distributed:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        device = torch.device(args.device)
+        rank = 0
+        world_size = 1
+    from dinov3.hub.backbones import dinov3_vit7b16
+    from dinov3.hub.classifiers import _LinearClassifierWrappe
     dataset, has_targets = _load_activation_dataset(args.activations)
 
     if isinstance(dataset, TensorDataset):

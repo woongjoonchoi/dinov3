@@ -28,13 +28,14 @@ RUN python -m pip install --upgrade pip && \
 
 COPY . ./
 
-
 # RUN pip install --upgrade pip \
 #     && pip install --no-cache-dir -r requirements.txt \
 #     && pip install --no-cache-dir -e .
 
 # 여기서부터는 무조건 python3 -m pip 사용
+# RUN python -m pip install --upgrade pip && \
+#     python -m pip install --no-cache-dir -r requirements.txt && \
+#     python -m pip install --no-cache-dir -e .
 RUN python -m pip install --no-cache-dir -e .
-
 # ENTRYPOINT ["python", "tools/eval_imagenet_accuracy_ddp.py"]
-ENTRYPOINT ["python", "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=4", "tools/eval_imagenet_accuracy_ddp.py"]
+ENTRYPOINT ["python", "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=4", "tools/run_linear_head_on_activations.py"]

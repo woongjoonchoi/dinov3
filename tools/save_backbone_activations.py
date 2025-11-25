@@ -21,9 +21,22 @@ from torchvision.transforms import v2
 
 from dinov3.hub.backbones import Weights as BackboneWeights
 from dinov3.hub.backbones import dinov3_vit7b16
-from dinov3.hub.classifiers import _resolve_weights
+# from dinov3.hub.classifiers import _resolve_weights
 from tqdm import tqdm
 
+
+
+def _resolve_weights(value: Optional[str], enum_type):
+    """Convert a CLI weight argument to the correct type for torch hub loaders."""
+
+    if value is None:
+        return value
+    normalized = value.strip().upper()
+    try:
+        return enum_type[normalized]
+    except KeyError:
+        # Treat as path or URL.
+        return value
 
 class ImageFolderWithPaths(datasets.ImageFolder):
     """ImageFolder that also returns the image path."""
@@ -82,7 +95,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backbone-weights",
         type=str,
-        default=BackboneWeights.LVD1689M.name,
+        default="/app/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth",
         help="Backbone weights enum name, checkpoint path, or URL.",
     )
     parser.add_argument(
@@ -150,14 +163,22 @@ def main() -> None:
         device = torch.device(args.device)
         rank = 0
         world_size = 1
-
-    backbone_weight = _resolve_weights(args.backbone_weights, BackboneWeights)
-    backbone = dinov3_vit7b16(pretrained=True, weights=backbone_weight)
+    backbone = dinov3_vit7b16(
+        pretrained=False,    # 여기서 더 이상 URL 안 타게
+        weights=None,        # 중요: weights=None
+        check_hash=False,
+    )
+    # backbone_weight = _resolve_weights(args.backbone_weights, BackboneWeights)
+    # backbone = dinov3_vit7b16(pretrained=True, weights=backbone_weight)
+    backbone_ckpt_path = "/dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"
+    backbone_state = torch.load(backbone_ckpt_path, map_location="cpu")
+    backbone.load_state_dict(backbone_state, strict=True)
     backbone.to(device)
     if args.distributed:
+        print(f"distributed")
         backbone = DDP(backbone, device_ids=[device] if device.type == "cuda" else None)
     backbone.eval()
-
+    print(f"rank : {rank} :world_size :{world_size}")
     loader = _build_loader(
         args.data_dir,
         args.batch_size,
