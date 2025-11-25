@@ -137,9 +137,16 @@ def _extract_and_save(
 
             image_stem = pathlib.Path(path).stem
             output_path = class_dir / f"{image_stem}.pt"
+
+            # print(f"activations shap e:{activation.shape}")
+            # print("dtype:", activation.dtype)
+            # print("numel:", activation.numel())
+            # print("element_size:", activation.element_size(), "bytes")  # float32면 4
+            # print("size MB:", activation.numel() * activation.element_size() / 1024**2)
+
             torch.save(
                 {
-                    "activation": activation,
+                    "activation": activation.clone(),
                     "class_idx": int(target),
                     "class_name": class_name,
                     "source_path": str(path),
