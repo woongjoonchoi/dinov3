@@ -26,6 +26,30 @@ from torchvision.transforms import v2
 
 
 
+def _build_loader(
+    root: pathlib.Path,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    distributed: bool,
+    rank: int,
+    world_size: int,
+) -> DataLoader:
+    dataset = datasets.ImageFolder(root=str(root), transform=make_transform())
+    sampler = None
+    if distributed:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=False
+        )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
 @torch.inference_mode()
 def _evaluate_head(
     linear_head: torch.nn.Linear,
@@ -197,7 +221,7 @@ def main() -> None:
         rank = 0
         world_size = 1
     from dinov3.hub.backbones import dinov3_vit7b16
-    from dinov3.hub.classifiers import _LinearClassifierWrappe
+    from dinov3.hub.classifiers import _LinearClassifierWrapper
     dataset, has_targets = _load_activation_dataset(args.activations)
 
     if isinstance(dataset, TensorDataset):
@@ -214,25 +238,50 @@ def main() -> None:
     linear_head = torch.nn.Linear(in_features, 1000)
 
     # Load weights; _resolve_weights from eval script not reused to keep this standalone.
-    weight_spec = args.linear_head_weights.strip()
-    if weight_spec.upper() in ClassifierWeights.__members__:
-        weight_enum = ClassifierWeights[weight_spec.upper()]
-        state_dict = weight_enum.get_state_dict(progress=True)
-    else:
-        state_dict = torch.load(weight_spec, map_location="cpu")
-    linear_head.load_state_dict(state_dict)
+    # weight_spec = args.linear_head_weights.strip()
+    # if weight_spec.upper() in ClassifierWeights.__members__:
+    #     weight_enum = ClassifierWeights[weight_spec.upper()]
+    #     state_dict = weight_enum.get_state_dict(progress=True)
+    # else:
+    #     state_dict = torch.load(weight_spec, map_location="cpu")
+    # linear_head.load_state_dict(state_dict)
+
+    head_ckpt_path = "/dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth"
+    head_state = torch.load(head_ckpt_path, map_location="cpu")
+    linear_head.load_state_dict(head_state, strict=True)
     linear_head.to(device)
+    if args.distributed:
+        linear_head = DDP(linear_head, device_ids=[device] if device.type == "cuda" else None)
+    linear_head.eval()
+    splits = []
+    if args.train_dir is not None:
+        splits.append(("train", args.train_dir))
+    if args.val_dir is not None:
+        splits.append(("val", args.val_dir))
+    # loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    for split_name, split_dir in splits:
+        loader = _build_loader(
+            split_dir,
+            args.batch_size,
+            args.num_workers,
+            args.pin_memory,
+            args.distributed,
+            rank,
+            world_size,
+        )
+        _evaluate_head(
+            linear_head=linear_head,
+            loader=loader,
+            device=device,
+            has_targets=has_targets,
+            save_logits=args.save_logits,
+        )
 
-    _evaluate_head(
-        linear_head=linear_head,
-        loader=loader,
-        device=device,
-        has_targets=has_targets,
-        save_logits=args.save_logits,
-    )
 
+
+    if args.distributed:
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

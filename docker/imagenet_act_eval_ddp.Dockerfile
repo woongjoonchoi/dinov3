@@ -38,4 +38,4 @@ COPY . ./
 #     python -m pip install --no-cache-dir -e .
 RUN python -m pip install --no-cache-dir -e .
 # ENTRYPOINT ["python", "tools/eval_imagenet_accuracy_ddp.py"]
-ENTRYPOINT ["python", "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=4", "tools/run_linear_head_on_activations.py"]
+ENTRYPOINT ["python", "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=4", "tools/eval_activation_linear_head_ddp.py"]

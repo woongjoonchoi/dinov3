@@ -81,7 +81,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=pathlib.Path, required=True, help="Directory containing activation .pt files.")
     parser.add_argument("--linear-head-checkpoint", type=pathlib.Path, required=True, help="Path to the linear head checkpoint.")
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size per device.")
-    parser.add_argument("--num-workers", type=int, default=8, help="Number of dataloader workers.")
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of dataloader workers.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on.")
     parser.add_argument("--distributed", action="store_true", help="Use torch.distributed with torchrun for multi-GPU evaluation.")
     parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
