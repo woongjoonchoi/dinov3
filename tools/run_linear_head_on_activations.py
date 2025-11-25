@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import argparse
 import pathlib
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from dinov3.hub.classifiers import ClassifierWeights
 
@@ -120,48 +120,74 @@ def _extract_activation_and_target(payload: object) -> tuple[torch.Tensor, Optio
     return activations, targets
 
 
-def _load_activation_tensors(path: pathlib.Path) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if path.is_dir():
-        activation_list: list[torch.Tensor] = []
-        target_list: list[torch.Tensor] = []
-        has_targets = True
+class _ActivationDirectoryDataset(Dataset[torch.Tensor]):
+    """Lazily load per-sample activation files to avoid holding them in RAM."""
 
-        for activation_file in sorted(path.rglob("*.pt")):
-            payload = torch.load(activation_file, map_location="cpu")
-            activation, target = _extract_activation_and_target(payload)
-            activation_list.append(activation)
+    def __init__(self, activation_files: Sequence[pathlib.Path]):
+        if not activation_files:
+            raise FileNotFoundError("No activation .pt files found in the provided directory.")
+        self.activation_files = list(sorted(activation_files))
+
+        # Inspect the first file to determine whether targets are expected for all samples.
+        first_payload = torch.load(self.activation_files[0], map_location="cpu")
+        _, target = _extract_activation_and_target(first_payload)
+        self.has_targets = target is not None
+
+    def __len__(self) -> int:
+        return len(self.activation_files)
+
+    def __getitem__(self, idx: int):
+        payload = torch.load(self.activation_files[idx], map_location="cpu")
+        activation, target = _extract_activation_and_target(payload)
+        if activation.ndim == 1:
+            activation = activation.unsqueeze(0)
+        if self.has_targets:
             if target is None:
-                has_targets = False
-            else:
-                target_list.append(target)
+                raise ValueError(
+                    "Target is missing for a sample even though targets were detected in the directory."
+                )
+            if isinstance(target, torch.Tensor) and target.ndim == 0:
+                target = target.unsqueeze(0)
+            return activation.squeeze(0), target.squeeze(0)
+        return activation.squeeze(0)
 
-        if not activation_list:
-            raise FileNotFoundError(f"No activation .pt files found under {path}.")
 
-        stacked_activations = torch.stack(activation_list)
-        if has_targets and len(target_list) == len(activation_list):
-            stacked_targets: Optional[torch.Tensor] = torch.stack(target_list)
-        else:
-            stacked_targets = None
-        return stacked_activations, stacked_targets
+def _load_activation_dataset(path: pathlib.Path) -> tuple[Dataset, bool]:
+    if path.is_dir():
+        activation_files = list(path.rglob("*.pt"))
+        dataset = _ActivationDirectoryDataset(activation_files)
+        return dataset, dataset.has_targets
 
     payload = torch.load(path, map_location="cpu")
     activation, targets = _extract_activation_and_target(payload)
     if activation.ndim == 1:
         activation = activation.unsqueeze(0)
-    return activation, targets
+
+    tensors = [activation]
+    has_targets = targets is not None
+    if has_targets:
+        if isinstance(targets, torch.Tensor) and targets.ndim == 0:
+            targets = targets.unsqueeze(0)
+        tensors.append(targets)
+    dataset = TensorDataset(*tensors)
+    return dataset, has_targets
 
 
 def main() -> None:
     args = _parse_args()
-    activations, targets = _load_activation_tensors(args.activations)
-    if activations.ndim != 2:
-        raise ValueError("Activations must be a 2D tensor of shape [N, 2 * embed_dim].")
+    dataset, has_targets = _load_activation_dataset(args.activations)
+
+    if isinstance(dataset, TensorDataset):
+        activation_sample = dataset.tensors[0]
+    else:
+        activation_sample, *_ = dataset[0]
+    if activation_sample.ndim != 1:
+        raise ValueError("Activations must be a 1D embedding vector of shape [2 * embed_dim].")
 
     device = torch.device(args.device)
 
     # Build the linear head with the correct input dimension inferred from the activations.
-    in_features = activations.shape[1]
+    in_features = activation_sample.shape[0]
     linear_head = torch.nn.Linear(in_features, 1000)
 
     # Load weights; _resolve_weights from eval script not reused to keep this standalone.
@@ -174,11 +200,6 @@ def main() -> None:
     linear_head.load_state_dict(state_dict)
     linear_head.to(device)
 
-    tensors = [activations]
-    has_targets = targets is not None
-    if has_targets:
-        tensors.append(targets)
-    dataset = TensorDataset(*tensors)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
     _evaluate_head(
