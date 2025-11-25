@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME=${IMAGE_NAME:-dinov3-imagenet-eval}
+IMAGE_NAME=${IMAGE_NAME:-dinov3-imagenet-eval-ddp}
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
@@ -11,26 +11,41 @@ usage() {
 Usage: docker/run_imagenet_eval.sh [docker-run-args ...] -- [evaluation-script-args]
 
 Examples:
-bash  docker/run_imagenet_eval.sh  \
+bash  docker/run_imagenet_eval_ddp.sh  \
   --gpus all \
   -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
+    -v ~/dinov3_pth:/dinov3_pth:ro \
   -- \
   --train-dir /datasets/imagenet/train \
   --val-dir /datasets/imagenet/val \
   --device cuda
 
 
-bash  docker/run_imagenet_eval.sh  \
+bash  docker/imagenet_act_eval_ddp.sh  \
   --gpus all \
-    --shm-size=24g \
-  -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
+    --shm-size=120g \
+   -v ~/imagenet_act/imagenet-1k:/datasets/imagenet:ro \
+      -v ~/dinov3_pth:/dinov3_pth:ro \
+  -- \
+    --batch-size 4096 \
+  --data-dir /datasets/imagenet/val \
+  --linear-head-checkpoint /dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth \
+  --device cuda \
+  --distributed 
 
+bash  docker/run_imagenet_eval_ddp.sh  \
+  --gpus all \
+    --shm-size=120g \
+  -v ~/imagenet/imagenet-1k:/datasets/imagenet:ro \
+      -v ~/dinov3_pth:/dinov3_pth:ro \
   -- \
     --batch-size 1024 \
   --val-dir /datasets/imagenet/val \
-  --device cuda
+  --device cuda \
+  --distributed 
 
-  docker/run_imagenet_eval.sh -- \
+
+  docker/run_imagenet_eval_ddp.sh -- \
     --gpus all \ 
     -v /path/to/imagenet:/datasets/imagenet:ro \
       --train-dir /datasets/imagenet/train --val-dir /datasets/imagenet/val --device cuda
@@ -68,7 +83,7 @@ for arg in "$@"; do
 done
 
 if [[ ${#eval_args[@]} -eq 0 ]]; then
-    echo "[ERROR] Missing arguments for tools/eval_imagenet_accuracy.py" >&2
+    echo "[ERROR] Missing arguments for tools/eval_imagenet_accuracy_ddp.py" >&2
     usage
     exit 1
 fi
@@ -77,6 +92,6 @@ echo "docker_args: ${docker_args[@]}"
 echo "eval_args  : ${eval_args[@]}"
 
 
-docker build -f "${REPO_ROOT}/docker/imagenet_eval.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
+docker build -f "${REPO_ROOT}/docker/imagenet_act_eval_ddp.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
 
 docker run --rm "${docker_args[@]}" "${IMAGE_NAME}" "${eval_args[@]}"
