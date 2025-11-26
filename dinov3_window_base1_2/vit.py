@@ -239,19 +239,20 @@ class DinoVisionTransformerWindowLastGlobal(nn.Module):
             x.append(t2_x)
             hw_list.append(hw_tuple)
         for idx, blk in enumerate(self.blocks):
-            if self.rope_embed is not None:
-                rope_sincos = [self.rope_embed(H=H, W=W) for H, W in hw_list]
-            else:
-                rope_sincos = [None for _ in hw_list]
             if idx < self.global_block_start:
+                rope_sincos = [None for _ in hw_list]
                 updated_x = []
-                for tokens, rope, hw in zip(x, rope_sincos, hw_list):
+                for tokens, _, hw in zip(x, rope_sincos, hw_list):
                     global_tokens = tokens[:, : self.n_storage_tokens + 1]
                     patch_tokens = tokens[:, self.n_storage_tokens + 1 :]
-                    patch_tokens = blk(patch_tokens, rope, hw)
+                    patch_tokens = blk(patch_tokens, None, hw)
                     updated_x.append(torch.cat([global_tokens, patch_tokens], dim=1))
                 x = updated_x
             else:
+                if self.rope_embed is not None:
+                    rope_sincos = [self.rope_embed(H=H, W=W) for H, W in hw_list]
+                else:
+                    rope_sincos = [None for _ in hw_list]
                 x = blk(x, rope_sincos)
         all_x = x
         output = []
@@ -290,13 +291,14 @@ class DinoVisionTransformerWindowLastGlobal(nn.Module):
         output, total_block_len = [], len(self.blocks)
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         for i, blk in enumerate(self.blocks):
-            rope_sincos = self.rope_embed(H=H, W=W) if self.rope_embed is not None else None
             if i < self.global_block_start:
+                rope_sincos = None
                 global_tokens = x[:, : self.n_storage_tokens + 1]
                 patch_tokens = x[:, self.n_storage_tokens + 1 :]
                 patch_tokens = blk(patch_tokens, rope_sincos, (H, W))
                 x = torch.cat([global_tokens, patch_tokens], dim=1)
             else:
+                rope_sincos = self.rope_embed(H=H, W=W) if self.rope_embed is not None else None
                 x = blk(x, rope_sincos)
             if i in blocks_to_take:
                 output.append(x)
