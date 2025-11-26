@@ -23,7 +23,8 @@ from torchvision.transforms import v2
 from tqdm import tqdm
 
 from dinov3.hub.classifiers import _LinearClassifierWrapper
-from dionv3_window import DinoVisionTransformerWindow
+# from dionv3_window import DinoVisionTransformerWindow
+from dionv3_window_base2 import DinoVisionTransformerWindow
 
 
 def make_transform(resize_size: int = 256, crop_size: Optional[int] = 224):
@@ -101,11 +102,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone-checkpoint", type=pathlib.Path, required=True, help="Checkpoint containing the DinoVisionTransformerWindow weights.")
     parser.add_argument("--head-checkpoint", type=pathlib.Path, required=True, help="Linear head checkpoint aligned with the backbone.")
     parser.add_argument("--num-classes", type=int, default=1000, help="Number of output classes for the classifier head.")
-    parser.add_argument(
-        "--model-kwargs",
+    parser.add_argument( "--model-kwargs",
         type=json.loads,
         default={},
-        help="JSON object of keyword arguments forwarded to DinoVisionTransformerWindow (e.g. '{\\"embed_dim\\": 1024}')",
+        # help="JSON object of keyword arguments forwarded to DinoVisionTransformerWindow (e.g. '{\\"embed_dim\\": 1024}')",
     )
     args = parser.parse_args()
     if args.train_dir is None and args.val_dir is None:

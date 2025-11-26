@@ -94,7 +94,7 @@ def _build_loader(
     rank: int,
     world_size: int,
 ) -> DataLoader:
-    dataset = datasets.ImageFolder(root=str(root), transform=make_transform())
+    dataset = datasets.ImageFolder(root=str(root), transform=make_transform(resize_size=224,crop_size=224))
     sampler = None
     if distributed:
         sampler = torch.utils.data.distributed.DistributedSampler(
