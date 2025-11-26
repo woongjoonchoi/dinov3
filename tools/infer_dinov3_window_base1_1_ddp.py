@@ -129,7 +129,7 @@ def _load_state_dict(path: pathlib.Path) -> Dict[str, torch.Tensor]:
                 break
     if not isinstance(checkpoint, dict):
         raise RuntimeError(f"Unexpected checkpoint structure in {path}")
-    if any(k.startswith("module.")):
+    if any(k.startswith("module.") for k in checkpoint):
         checkpoint = {k.removeprefix("module."): v for k, v in checkpoint.items()}
     return checkpoint
 
