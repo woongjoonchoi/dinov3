@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from dinov3.hub.classifiers import _LinearClassifierWrapper
 from dinov3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1
+from dinov3_window_base1_1.vit import _PatchOnlyWindowBlock
 
 
 def make_transform(resize_size: int = 256, crop_size: Optional[int] = 224):
@@ -128,14 +129,49 @@ def _load_state_dict(path: pathlib.Path) -> Dict[str, torch.Tensor]:
                 break
     if not isinstance(checkpoint, dict):
         raise RuntimeError(f"Unexpected checkpoint structure in {path}")
-    if any(k.startswith("module.") for k in checkpoint):
+    if any(k.startswith("module.")):
         checkpoint = {k.removeprefix("module."): v for k, v in checkpoint.items()}
     return checkpoint
 
 
+def _remap_window_block_keys_to_patch_only(
+    model: DinoVisionTransformerWindowBaseline1_1, state_dict: Dict[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    """Adapt checkpoints from pre-patch-only window blocks.
+
+    Older checkpoints may store window block parameters directly under
+    ``blocks.{i}.norm1``/``attn``/``mlp``. The current Baseline1_1 wraps those
+    window blocks inside ``_PatchOnlyWindowBlock.patch_block``. This helper
+    moves keys into the nested module so they can load cleanly with ``strict``
+    semantics.
+    """
+
+    window_block_indices = [i for i, blk in enumerate(model.blocks) if isinstance(blk, _PatchOnlyWindowBlock)]
+    if not window_block_indices:
+        return state_dict
+
+    remapped: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for idx in window_block_indices:
+            prefix = f"blocks.{idx}."
+            nested_prefix = f"blocks.{idx}.patch_block."
+            if key.startswith(nested_prefix):
+                # Already in the expected location for patch-only blocks.
+                break
+            if key.startswith(prefix):
+                # Move legacy window block parameters under patch_block.
+                new_key = nested_prefix + key[len(prefix) :]
+                break
+        remapped[new_key] = value
+    return remapped
+
+
 def _build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
     backbone = DinoVisionTransformerWindowBaseline1_1(**args.model_kwargs)
-    backbone_state = _load_state_dict(args.backbone_checkpoint)
+    backbone_state = _remap_window_block_keys_to_patch_only(
+        backbone, _load_state_dict(args.backbone_checkpoint)
+    )
     backbone.load_state_dict(backbone_state, strict=True)
 
     embed_dim = backbone.embed_dim
