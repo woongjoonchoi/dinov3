@@ -8,7 +8,6 @@ from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbe
 from dinov3.utils import named_apply
 from dionv3_window.layers.window_block import WindowSelfAttentionBlock
 
-
 ffn_layer_dict = {
     "mlp": Mlp,
     "swiglu": SwiGLUFFN,
