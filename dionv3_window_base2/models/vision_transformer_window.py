@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -159,6 +159,19 @@ class DinoVisionTransformerWindow(nn.Module):
         self.rope_embed._init_weights()
         nn.init.zeros_(self.mask_token)
         named_apply(init_weights_vit, self)
+
+    def load_state_dict(self, state_dict: Mapping[str, Tensor], strict: bool = True):
+        state_dict = dict(state_dict)
+        ignored_keys = [
+            key
+            for key in state_dict.keys()
+            if key.endswith("cls_token") or key.endswith("storage_tokens") or key.endswith("register_tokens")
+        ]
+        for key in ignored_keys:
+            state_dict.pop(key, None)
+        if len(ignored_keys) > 0:
+            print(f"Ignored unexpected keys when loading state_dict: {ignored_keys}")
+        return super().load_state_dict(state_dict, strict=strict)
 
     def prepare_tokens_with_masks(self, x: Tensor, masks=None) -> Tuple[Tensor, Tuple[int, int]]:
         x = self.patch_embed(x)
