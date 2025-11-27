@@ -318,24 +318,38 @@ class LocalGlobalHybridVisionTransformer(nn.Module):
         self.head = nn.Identity()
         self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
 
+    def _normalize_state_dict(self, state_dict: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """Strip common wrappers (DDP/module/backbone prefixes) from checkpoint keys."""
+
+        def strip_prefix(key: str) -> str:
+            prefixes = [
+                "module.",
+                "backbone.",
+                "model.",
+            ]
+            for p in prefixes:
+                if key.startswith(p):
+                    return key[len(p) :]
+            return key
+
+        return {strip_prefix(k): v for k, v in state_dict.items()}
+
     def _remap_pretrained_state_dict(self, state_dict: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        """Remap original DINOv3 qkv/proj weights to the Baseline3 module layout.
+        """Remap original DINOv3 qkv/proj weights to the Baseline3 module layout."""
 
-        When loading checkpoints from the global or window-only backbone, the attention
-        parameters live under ``attn.qkv`` and ``attn.proj``. Baseline3 splits the
-        attention into local, global, and patch-to-global branches, so we synthesize
-        the expected parameters from the original tensors and drop the old keys.
-
-        This keeps ``strict=True`` loading working for existing checkpoints.
-        """
+        state_dict = self._normalize_state_dict(state_dict)
 
         def maybe_chunk_qkv(prefix: str):
             qkv_w = state_dict.get(f"{prefix}attn.qkv.weight")
-            qkv_b = state_dict.get(f"{prefix}attn.qkv.bias")
-            if qkv_w is None or qkv_b is None:
+            if qkv_w is None:
                 return None
+            qkv_b = state_dict.get(f"{prefix}attn.qkv.bias")
             q_w, k_w, v_w = qkv_w.chunk(3, dim=0)
-            q_b, k_b, v_b = qkv_b.chunk(3, dim=0)
+            if qkv_b is None:
+                zeros = torch.zeros(q_w.shape[0], device=qkv_w.device, dtype=qkv_w.dtype)
+                q_b, k_b, v_b = zeros, zeros, zeros
+            else:
+                q_b, k_b, v_b = qkv_b.chunk(3, dim=0)
             return (q_w, k_w, v_w, q_b, k_b, v_b)
 
         remapped = dict(state_dict)
@@ -346,37 +360,48 @@ class LocalGlobalHybridVisionTransformer(nn.Module):
                 continue
             q_w, k_w, v_w, q_b, k_b, v_b = chunks
 
+            proj_w = state_dict.get(f"{prefix}attn.proj.weight")
+            proj_b = state_dict.get(f"{prefix}attn.proj.bias")
+            if proj_b is None:
+                proj_b = torch.zeros_like(q_b)
+
             # Local branch weights
-            remapped.setdefault(f"{prefix}local_attn.q.weight", q_w.clone())
-            remapped.setdefault(f"{prefix}local_attn.q.bias", q_b.clone())
-            remapped.setdefault(f"{prefix}local_attn.k_local.weight", k_w.clone())
-            remapped.setdefault(f"{prefix}local_attn.k_local.bias", k_b.clone())
-            remapped.setdefault(f"{prefix}local_attn.v_local.weight", v_w.clone())
-            remapped.setdefault(f"{prefix}local_attn.v_local.bias", v_b.clone())
-            remapped.setdefault(f"{prefix}local_attn.k_global.weight", k_w.clone())
-            remapped.setdefault(f"{prefix}local_attn.k_global.bias", k_b.clone())
-            remapped.setdefault(f"{prefix}local_attn.v_global.weight", v_w.clone())
-            remapped.setdefault(f"{prefix}local_attn.v_global.bias", v_b.clone())
+            remapped[f"{prefix}local_attn.q.weight"] = q_w.clone()
+            remapped[f"{prefix}local_attn.q.bias"] = q_b.clone()
+            remapped[f"{prefix}local_attn.k_local.weight"] = k_w.clone()
+            remapped[f"{prefix}local_attn.k_local.bias"] = k_b.clone()
+            remapped[f"{prefix}local_attn.v_local.weight"] = v_w.clone()
+            remapped[f"{prefix}local_attn.v_local.bias"] = v_b.clone()
+            remapped[f"{prefix}local_attn.k_global.weight"] = k_w.clone()
+            remapped[f"{prefix}local_attn.k_global.bias"] = k_b.clone()
+            remapped[f"{prefix}local_attn.v_global.weight"] = v_w.clone()
+            remapped[f"{prefix}local_attn.v_global.bias"] = v_b.clone()
 
             # Global branch weights
-            remapped.setdefault(f"{prefix}global_q.weight", q_w.clone())
-            remapped.setdefault(f"{prefix}global_q.bias", q_b.clone())
-            remapped.setdefault(f"{prefix}global_kv.weight", torch.cat((k_w, v_w), dim=0))
-            remapped.setdefault(f"{prefix}global_kv.bias", torch.cat((k_b, v_b), dim=0))
-            remapped.setdefault(f"{prefix}global_proj.weight", state_dict.get(f"{prefix}attn.proj.weight"))
-            remapped.setdefault(f"{prefix}global_proj.bias", state_dict.get(f"{prefix}attn.proj.bias"))
+            remapped[f"{prefix}global_q.weight"] = q_w.clone()
+            remapped[f"{prefix}global_q.bias"] = q_b.clone()
+            remapped[f"{prefix}global_kv.weight"] = torch.cat((k_w, v_w), dim=0)
+            remapped[f"{prefix}global_kv.bias"] = torch.cat((k_b, v_b), dim=0)
+            if proj_w is not None:
+                remapped[f"{prefix}global_proj.weight"] = proj_w
+            if proj_b is not None:
+                remapped[f"{prefix}global_proj.bias"] = proj_b
 
             # Patch->global branch weights
-            remapped.setdefault(f"{prefix}patch_q.weight", q_w.clone())
-            remapped.setdefault(f"{prefix}patch_q.bias", q_b.clone())
-            remapped.setdefault(f"{prefix}patch_kv.weight", torch.cat((k_w, v_w), dim=0))
-            remapped.setdefault(f"{prefix}patch_kv.bias", torch.cat((k_b, v_b), dim=0))
-            remapped.setdefault(f"{prefix}patch_proj.weight", state_dict.get(f"{prefix}attn.proj.weight"))
-            remapped.setdefault(f"{prefix}patch_proj.bias", state_dict.get(f"{prefix}attn.proj.bias"))
+            remapped[f"{prefix}patch_q.weight"] = q_w.clone()
+            remapped[f"{prefix}patch_q.bias"] = q_b.clone()
+            remapped[f"{prefix}patch_kv.weight"] = torch.cat((k_w, v_w), dim=0)
+            remapped[f"{prefix}patch_kv.bias"] = torch.cat((k_b, v_b), dim=0)
+            if proj_w is not None:
+                remapped[f"{prefix}patch_proj.weight"] = proj_w
+            if proj_b is not None:
+                remapped[f"{prefix}patch_proj.bias"] = proj_b
 
             # Local projection
-            remapped.setdefault(f"{prefix}local_attn.proj.weight", state_dict.get(f"{prefix}attn.proj.weight"))
-            remapped.setdefault(f"{prefix}local_attn.proj.bias", state_dict.get(f"{prefix}attn.proj.bias"))
+            if proj_w is not None:
+                remapped[f"{prefix}local_attn.proj.weight"] = proj_w
+            if proj_b is not None:
+                remapped[f"{prefix}local_attn.proj.bias"] = proj_b
 
             # Remove old keys to avoid "unexpected" errors when strict=True
             remapped.pop(f"{prefix}attn.qkv.weight", None)
@@ -388,7 +413,15 @@ class LocalGlobalHybridVisionTransformer(nn.Module):
 
     def load_state_dict(self, state_dict: Dict[str, Tensor], strict: bool = True):
         remapped = self._remap_pretrained_state_dict(state_dict)
-        return super().load_state_dict(remapped, strict=strict)
+
+        model_state = self.state_dict()
+        filtered: Dict[str, Tensor] = {}
+        for k, v in model_state.items():
+            if k in remapped and isinstance(remapped[k], torch.Tensor):
+                filtered[k] = remapped[k]
+            else:
+                filtered[k] = v
+        return super().load_state_dict(filtered, strict=strict)
 
     def init_weights(self):
         self.rope_embed._init_weights()
