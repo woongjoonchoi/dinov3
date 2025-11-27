@@ -28,20 +28,6 @@ IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 
-# class ResizeLongestSide:
-#     def __init__(self, max_size: int):
-#         self.max_size = max_size
-
-#     def __call__(self, image):
-#         width, height = image.size
-#         longest = max(width, height)
-#         if longest <= self.max_size:
-#             return image
-#         scale = self.max_size / longest
-#         new_size = (int(round(height * scale)), int(round(width * scale)))
-#         return F.resize(image, new_size, interpolation=InterpolationMode.BICUBIC)
-
-
 class ResizeShortSide:
     def __init__(self, target_size: int):
         self.target_size = target_size
@@ -56,6 +42,7 @@ class ResizeShortSide:
         new_h = int(round(height * scale))
         # F.resize expects (H, W)
         return F.resize(image, (new_h, new_w), interpolation=InterpolationMode.BICUBIC)
+
 
 class CocoDetectionForEval(CocoDetection):
     def __init__(
@@ -116,6 +103,25 @@ def evaluate_predictions(coco_gt: COCO, predictions: List[dict]) -> None:
     evaluator.evaluate()
     evaluator.accumulate()
     evaluator.summarize()
+
+
+def evaluate_predictions_with_logging(
+    coco_gt: COCO,
+    predictions: List[dict],
+    *,
+    iteration: int | None = None,
+    require_nonempty: bool = True,
+) -> None:
+    prefix = "Final" if iteration is None else f"Iteration {iteration}"
+    if len(predictions) == 0:
+        message = f"{prefix}: no predictions; skipping evaluation"
+        if require_nonempty:
+            raise RuntimeError(message)
+        print(message)
+        return
+
+    print(f"{prefix}: evaluating {len(predictions)} predictions")
+    evaluate_predictions(coco_gt, predictions)
 
 
 def parse_args() -> argparse.Namespace:
@@ -203,8 +209,7 @@ def main() -> None:
         device = torch.device(args.device)
         rank = 0
         world_size = 1
-    
-    # print(f"device :{device}  rank:{rank}  world_size: {world_size}")
+
     coco_root = Path(args.coco_root)
     ann_file = (
         Path(args.ann_file)
@@ -255,13 +260,16 @@ def main() -> None:
         model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
     model.eval()
 
-    predictions: List[dict] = []
+    predictions_all: List[dict] = []
 
     with torch.no_grad():
-        for images, metas in tqdm(dataloader, desc="Evaluating", total=len(dataloader)):
+        for iteration, (images, metas) in enumerate(
+            tqdm(dataloader, desc="Evaluating", total=len(dataloader)), start=1
+        ):
             inputs = [img.to(device) for img in images]
             outputs = model(inputs)
 
+            batch_predictions: List[dict] = []
             for output, meta in zip(outputs, metas):
                 boxes = output["boxes"].cpu()
                 scores = output["scores"].cpu()
@@ -282,7 +290,7 @@ def main() -> None:
 
                     x_min, y_min, x_max, y_max = box.tolist()
                     coco_box = [x_min, y_min, x_max - x_min, y_max - y_min]
-                    predictions.append(
+                    batch_predictions.append(
                         {
                             "image_id": meta["image_id"],
                             "category_id": id_map.get(int(label), int(label)),
@@ -290,17 +298,28 @@ def main() -> None:
                             "score": float(score),
                         }
                     )
-    if args.distributed:
-        gathered: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore[list-item]
-        dist.all_gather_object(gathered, predictions)
-        if rank == 0:
-            predictions = [p for sublist in gathered for p in sublist]
+
+            if args.distributed:
+                gathered_batches: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore[list-item]
+                dist.all_gather_object(gathered_batches, batch_predictions)
+                if rank == 0:
+                    merged_batch = [pred for sublist in gathered_batches for pred in sublist]
+                    predictions_all.extend(merged_batch)
+                    evaluate_predictions_with_logging(
+                        dataset.coco, merged_batch, iteration=iteration, require_nonempty=False
+                    )
+            else:
+                predictions_all.extend(batch_predictions)
+                evaluate_predictions_with_logging(
+                    dataset.coco, batch_predictions, iteration=iteration, require_nonempty=False
+                )
+
     if not args.distributed or rank == 0:
         output_path = Path(args.output_json)
-        output_path.write_text(json.dumps(predictions))
-        print(f"Saved {len(predictions)} predictions to {output_path}")
+        output_path.write_text(json.dumps(predictions_all))
+        print(f"Saved {len(predictions_all)} predictions to {output_path}")
 
-        evaluate_predictions(dataset.coco, predictions)
+        evaluate_predictions_with_logging(dataset.coco, predictions_all, iteration=None)
 
     if args.distributed:
         dist.destroy_process_group()
