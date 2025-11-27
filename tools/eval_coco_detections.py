@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
 import torch
+import torch.distributed as dist
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import CocoDetection
@@ -24,18 +27,20 @@ IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 
-class ResizeLongestSide:
-    def __init__(self, max_size: int):
-        self.max_size = max_size
+class ResizeShortSide:
+    def __init__(self, target_size: int):
+        self.target_size = target_size
 
     def __call__(self, image):
-        width, height = image.size
-        longest = max(width, height)
-        if longest <= self.max_size:
+        width, height = image.size  # (W, H)
+        short = min(width, height)
+        if short == self.target_size:
             return image
-        scale = self.max_size / longest
-        new_size = (int(round(height * scale)), int(round(width * scale)))
-        return F.resize(image, new_size, interpolation=InterpolationMode.BICUBIC)
+        scale = self.target_size / short
+        new_w = int(round(width * scale))
+        new_h = int(round(height * scale))
+        # F.resize expects (H, W)
+        return F.resize(image, (new_h, new_w), interpolation=InterpolationMode.BICUBIC)
 
 
 class CocoDetectionForEval(CocoDetection):
@@ -57,7 +62,7 @@ class CocoDetectionForEval(CocoDetection):
         orig_w, orig_h = image.size
 
         if self.max_size:
-            image = ResizeLongestSide(self.max_size)(image)
+            image = ResizeShortSide(self.max_size)(image)
         resized_w, resized_h = image.size
 
         image = self.image_transform(image)
@@ -111,7 +116,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size for evaluation.")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of dataloader workers.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device for inference (cuda or cpu).")
-    parser.add_argument("--max-size", type=int, default=None, help="Optional maximum size for the longest image side; keeps aspect ratio.")
+    parser.add_argument("--distributed", action="store_true", help="Use torch.distributed with torchrun for multi-GPU evaluation.")
+    parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
+    parser.add_argument("--max-size", type=int, default=None, help="Optional maximum size for the shortest image side; keeps aspect ratio.")
     parser.add_argument("--score-threshold", type=float, default=0.0, help="Discard predictions below this confidence.")
     parser.add_argument("--detector-weights", default=detectors.DetectionWeights.COCO2017, help="Detector checkpoint to use.")
     parser.add_argument("--backbone-weights", default=backbones.Weights.LVD1689M, help="Backbone checkpoint to use.")
@@ -121,6 +128,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if args.distributed:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        device = torch.device(args.device)
+        rank = 0
+        world_size = 1
 
     coco_root = Path(args.coco_root)
     ann_file = (
@@ -141,15 +162,28 @@ def main() -> None:
 
     id_map = coco_id_mapping(dataset.coco)
 
-    dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, num_workers=args.num_workers, collate_fn=_collate_fn
-    )
+    sampler = None
+    if args.distributed:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=False
+        )
 
-    device = torch.device(args.device)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        collate_fn=_collate_fn,
+        sampler=sampler,
+        shuffle=False,
+        pin_memory=args.pin_memory,
+    )
     model = detectors.dinov3_vit7b16_de(
         pretrained=True, weights=args.detector_weights, backbone_weights=args.backbone_weights
     )
-    model.to(device).eval()
+    model.to(device)
+    if args.distributed:
+        model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
+    model.eval()
 
     predictions: List[dict] = []
 
@@ -186,12 +220,20 @@ def main() -> None:
                             "score": float(score),
                         }
                     )
+    if args.distributed:
+        gathered: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore[list-item]
+        dist.all_gather_object(gathered, predictions)
+        if rank == 0:
+            predictions = [p for sublist in gathered for p in sublist]
+    if not args.distributed or rank == 0:
+        output_path = Path(args.output_json)
+        output_path.write_text(json.dumps(predictions))
+        print(f"Saved {len(predictions)} predictions to {output_path}")
 
-    output_path = Path(args.output_json)
-    output_path.write_text(json.dumps(predictions))
-    print(f"Saved {len(predictions)} predictions to {output_path}")
+        evaluate_predictions(dataset.coco, predictions)
 
-    evaluate_predictions(dataset.coco, predictions)
+    if args.distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
