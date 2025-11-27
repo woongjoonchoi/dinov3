@@ -21,27 +21,22 @@ bash  docker/run_imagenet_eval_ddp.sh  \
   --device cuda
 
 
-bash  docker/run_imagenet_eval_ddp.sh  \
+bash  docker/run_coco_eval_ddp.sh  \
   --gpus all \
     --shm-size=120g \
-  -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
+  -v /projects3/datasets/coco/coco2017:/datasets/coco:ro \
       -v ~/dinov3_pth:/dinov3_pth:ro \
   -- \
-    --batch-size 256 \
-  --val-dir /datasets/imagenet/val \
-  --device cuda \
-  --distributed 
-
-bash  docker/run_imagenet_eval_ddp.sh  \
-  --gpus all \
-    --shm-size=120g \
-  -v ~/imagenet/imagenet-1k:/datasets/imagenet:ro \
-      -v ~/dinov3_pth:/dinov3_pth:ro \
-  -- \
+  --backbone-weights  /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
+    --detector-weights  /dinov3_pth/dinov3_vit7b16_coco_detr_head-b0235ff7.pth \
     --batch-size 1024 \
-  --val-dir /datasets/imagenet/val \
+  --coco-root /datasets/coco \
+  --max-size 1536 \
   --device cuda \
-  --distributed 
+  --distributed  
+
+
+
 
 
   docker/run_imagenet_eval_ddp.sh -- \
@@ -91,6 +86,6 @@ echo "docker_args: ${docker_args[@]}"
 echo "eval_args  : ${eval_args[@]}"
 
 
-docker build -f "${REPO_ROOT}/docker/imagenet_eval_ddp.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
+docker build -f "${REPO_ROOT}/docker/coco_eval_ddp.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
 
 docker run --rm "${docker_args[@]}" "${IMAGE_NAME}" "${eval_args[@]}"

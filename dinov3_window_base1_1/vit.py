@@ -130,7 +130,7 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
             global_block_set = set(global_block_indices)
         else:
             global_block_set = None
-
+        print(f"global block interval : {global_block_interval}")
         blocks_list = []
         for i in range(depth):
             is_global = False

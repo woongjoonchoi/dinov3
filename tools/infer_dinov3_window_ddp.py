@@ -22,7 +22,8 @@ from torchvision import datasets
 from torchvision.transforms import v2
 from tqdm import tqdm
 
-from dinov3.hub.classifiers import _LinearClassifierWrapper
+# from dinov3.hub.classifiers import _LinearClassifierWrapper
+from dionv3_window_base2.hub.linear_classifier_gap import _GapLinearClassifierWrapper
 # from dionv3_window import DinoVisionTransformerWindow
 from dionv3_window_base2 import DinoVisionTransformerWindow
 
@@ -133,12 +134,41 @@ def _build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Mod
     backbone.load_state_dict(backbone_state, strict=True)
 
     embed_dim = backbone.embed_dim
-    linear_in_dim = 2 * embed_dim
-    linear_head = torch.nn.Linear(linear_in_dim, args.num_classes)
-    head_state = _load_state_dict(args.head_checkpoint)
-    linear_head.load_state_dict(head_state, strict=True)
 
-    model = _LinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
+    # linear_in_dim = 2 * embed_dim
+    linear_in_dim =  embed_dim
+    # linear_head = torch.nn.Linear(linear_in_dim, args.num_classes)
+    # head_state = _load_state_dict(args.head_checkpoint)
+    # linear_head.load_state_dict(head_state, strict=True)
+    # 기존: CLS+GAP concat(2C) 기준으로 학습된 head의 checkpoint 로드
+    head_state = _load_state_dict(args.head_checkpoint)
+
+    # checkpoint 안에 들어있는 weight / bias 꺼내기
+    old_weight = head_state["weight"]  # [num_classes, 2C]
+    old_bias   = head_state["bias"]    # [num_classes]
+
+    # 옛날 head의 in_dim = 2C
+    old_in_dim = old_weight.shape[1]
+    C = old_in_dim // 2
+
+    # 이제 backbone은 GAP만 쓰니까, 입력 차원 = C 여야 함
+    assert linear_in_dim == C, f"linear_in_dim={linear_in_dim}, but checkpoint has 2C={old_in_dim}"
+
+    # 새 head: GAP만 입력으로 받는 Linear(C -> num_classes)
+    linear_head = torch.nn.Linear(C, args.num_classes)
+
+    # W_gap 만 가져와서 초기화 (두 번째 절반)
+    W_gap = old_weight[:, C:]  # [num_classes, C]
+
+    with torch.no_grad():
+        linear_head.weight.copy_(W_gap)
+        linear_head.bias.copy_(old_bias)
+
+
+
+    # model = _LinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
+    model = _GapLinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
+    
     model.to(device)
     return model
 

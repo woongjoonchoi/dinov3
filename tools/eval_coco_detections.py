@@ -24,19 +24,34 @@ IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 
-class ResizeLongestSide:
-    def __init__(self, max_size: int):
-        self.max_size = max_size
+# class ResizeLongestSide:
+#     def __init__(self, max_size: int):
+#         self.max_size = max_size
+
+#     def __call__(self, image):
+#         width, height = image.size
+#         longest = max(width, height)
+#         if longest <= self.max_size:
+#             return image
+#         scale = self.max_size / longest
+#         new_size = (int(round(height * scale)), int(round(width * scale)))
+#         return F.resize(image, new_size, interpolation=InterpolationMode.BICUBIC)
+
+
+class ResizeShortSide:
+    def __init__(self, target_size: int):
+        self.target_size = target_size
 
     def __call__(self, image):
-        width, height = image.size
-        longest = max(width, height)
-        if longest <= self.max_size:
+        width, height = image.size  # (W, H)
+        short = min(width, height)
+        if short == self.target_size:
             return image
-        scale = self.max_size / longest
-        new_size = (int(round(height * scale)), int(round(width * scale)))
-        return F.resize(image, new_size, interpolation=InterpolationMode.BICUBIC)
-
+        scale = self.target_size / short
+        new_w = int(round(width * scale))
+        new_h = int(round(height * scale))
+        # F.resize expects (H, W)
+        return F.resize(image, (new_h, new_w), interpolation=InterpolationMode.BICUBIC)
 
 class CocoDetectionForEval(CocoDetection):
     def __init__(
@@ -57,7 +72,7 @@ class CocoDetectionForEval(CocoDetection):
         orig_w, orig_h = image.size
 
         if self.max_size:
-            image = ResizeLongestSide(self.max_size)(image)
+            image = ResizeShortSide(self.max_size)(image)
         resized_w, resized_h = image.size
 
         image = self.image_transform(image)
