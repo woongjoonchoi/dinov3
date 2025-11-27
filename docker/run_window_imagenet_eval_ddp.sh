@@ -11,23 +11,18 @@ usage() {
 Usage: docker/run_imagenet_eval.sh [docker-run-args ...] -- [evaluation-script-args]
 
 Examples:
-bash  docker/run_imagenet_eval_ddp.sh  \
-  --gpus all \
-  -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
-    -v ~/dinov3_pth:/dinov3_pth:ro \
-  -- \
-  --train-dir /datasets/imagenet/train \
-  --val-dir /datasets/imagenet/val \
-  --device cuda
 
 
-bash  docker/run_imagenet_eval_ddp.sh  \
+
+bash  docker/run_window_imagenet_eval_ddp.sh  \
   --gpus all \
     --shm-size=120g \
   -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
       -v ~/dinov3_pth:/dinov3_pth:ro \
   -- \
-    --batch-size 256 \
+    --batch-size 1024 \
+    --backbone-checkpoint  /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
+    --head-checkpoint  /dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth \
   --val-dir /datasets/imagenet/val \
   --device cuda \
   --distributed 
@@ -91,6 +86,6 @@ echo "docker_args: ${docker_args[@]}"
 echo "eval_args  : ${eval_args[@]}"
 
 
-docker build -f "${REPO_ROOT}/docker/imagenet_eval_ddp.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
+docker build -f "${REPO_ROOT}/docker/widnow_imagenet_eval_ddp.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
 
 docker run --rm "${docker_args[@]}" "${IMAGE_NAME}" "${eval_args[@]}"

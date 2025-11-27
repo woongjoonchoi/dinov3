@@ -31,6 +31,7 @@ from dinov3.hub.classifiers import (
     ClassifierWeights,
     dinov3_vit7b16_lc,
 )
+from dionv3_window_base2.hub.linear_classifier_gap import _GapLinearClassifierWrapper
 from dinov3.hub.backbones import Weights as BackboneWeights
 from tqdm import tqdm
 
@@ -94,7 +95,7 @@ def _build_loader(
     rank: int,
     world_size: int,
 ) -> DataLoader:
-    dataset = datasets.ImageFolder(root=str(root), transform=make_transform())
+    dataset = datasets.ImageFolder(root=str(root), transform=make_transform(resize_size=512,crop_size=512))
     sampler = None
     if distributed:
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -178,17 +179,48 @@ def main() -> None:
     embed_dim = backbone.embed_dim  # 예: 4096 또는 8192
 
     # 3) linear head 생성 (DINOv3가 쓰는 구조: [cls, mean(patch)] concat → Linear)
-    linear_in_dim = 2 * embed_dim          # wrapper에서 concat 하니까 2배
-    linear_head = torch.nn.Linear(linear_in_dim, 1000)  # ImageNet-1k
+    # linear_in_dim = 2 * embed_dim          # wrapper에서 concat 하니까 2배
+    # linear_head = torch.nn.Linear(linear_in_dim, 1000)  # ImageNet-1k
 
-    # 4) linear head local weight 로드
-    # head_ckpt_path = "/app/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth"
+    # # 4) linear head local weight 로드
+    # # head_ckpt_path = "/app/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth"
     head_ckpt_path = "/dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth"
+    # head_state = torch.load(head_ckpt_path, map_location="cpu")
+    # linear_head.load_state_dict(head_state, strict=True)
+
+    # linear_in_dim = 2 * embed_dim
+    linear_in_dim =  embed_dim
+    # linear_head = torch.nn.Linear(linear_in_dim, args.num_classes)
+    # head_state = _load_state_dict(args.head_checkpoint)
+    # linear_head.load_state_dict(head_state, strict=True)
+    # 기존: CLS+GAP concat(2C) 기준으로 학습된 head의 checkpoint 로드
+    # head_state = _load_state_dict(args.head_checkpoint)
     head_state = torch.load(head_ckpt_path, map_location="cpu")
-    linear_head.load_state_dict(head_state, strict=True)
+
+    # checkpoint 안에 들어있는 weight / bias 꺼내기
+    old_weight = head_state["weight"]  # [num_classes, 2C]
+    old_bias   = head_state["bias"]    # [num_classes]
+
+    # 옛날 head의 in_dim = 2C
+    old_in_dim = old_weight.shape[1]
+    C = old_in_dim // 2
+
+    # 이제 backbone은 GAP만 쓰니까, 입력 차원 = C 여야 함
+    assert linear_in_dim == C, f"linear_in_dim={linear_in_dim}, but checkpoint has 2C={old_in_dim}"
+
+    # 새 head: GAP만 입력으로 받는 Linear(C -> num_classes)
+    linear_head = torch.nn.Linear(C, 1000)
+
+    # W_gap 만 가져와서 초기화 (두 번째 절반)
+    W_gap = old_weight[:, C:]  # [num_classes, C]
+
+    with torch.no_grad():
+        linear_head.weight.copy_(W_gap)
+        linear_head.bias.copy_(old_bias)
 
     # 5) DINOv3 전용 wrapper로 합치기
-    model = _LinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
+    # model = _LinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
+    model = _GapLinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
     model.to(device)
     if args.distributed:
         model = DDP(model, device_ids=[device] if device.type == "cuda" else None)

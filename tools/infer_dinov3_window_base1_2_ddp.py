@@ -25,7 +25,7 @@ from dinov3.hub.classifiers import _LinearClassifierWrapper
 from dinov3_window_base1_2 import DinoVisionTransformerWindowLastGlobal
 
 
-def make_transform(resize_size: int = 256, crop_size: Optional[int] = 224):
+def make_transform(resize_size: int = 224, crop_size: Optional[int] = 224):
     """Return the standard ImageNet transform recommended in the README."""
 
     to_image = v2.ToImage()
@@ -132,6 +132,7 @@ def _load_state_dict(path: pathlib.Path) -> Dict[str, torch.Tensor]:
 
 
 def _build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
+    print(f"args.model_kwargs :{args.model_kwargs}")
     backbone = DinoVisionTransformerWindowLastGlobal(**args.model_kwargs)
     backbone_state = _load_state_dict(args.backbone_checkpoint)
     backbone.load_state_dict(backbone_state, strict=True)
