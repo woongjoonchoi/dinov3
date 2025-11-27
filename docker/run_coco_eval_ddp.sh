@@ -27,9 +27,9 @@ bash  docker/run_coco_eval_ddp.sh  \
   -v /projects3/datasets/coco/coco2017:/datasets/coco:ro \
       -v ~/dinov3_pth:/dinov3_pth:ro \
   -- \
-  --backbone-weights  /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
-    --detector-weights  /dinov3_pth/dinov3_vit7b16_coco_detr_head-b0235ff7.pth \
-    --batch-size 1024 \
+  --backbone-checkpoint  /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
+    --detector-checkpoint  /dinov3_pth/dinov3_vit7b16_coco_detr_head-b0235ff7.pth \
+    --batch-size 2 \
   --coco-root /datasets/coco \
   --max-size 1536 \
   --device cuda \

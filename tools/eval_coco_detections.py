@@ -203,7 +203,8 @@ def main() -> None:
         device = torch.device(args.device)
         rank = 0
         world_size = 1
-
+    
+    # print(f"device :{device}  rank:{rank}  world_size: {world_size}")
     coco_root = Path(args.coco_root)
     ann_file = (
         Path(args.ann_file)
@@ -243,7 +244,13 @@ def main() -> None:
         shuffle=False,
         pin_memory=args.pin_memory,
     )
-    model = _build_model_from_checkpoints(args, device)
+    # model = _build_model_from_checkpoints(args, device)
+    model = detectors.dinov3_vit7b16_de(
+        pretrained=False,  # 이미 weights를 직접 주니까 굳이 True일 필요 없음
+        weights=args.detector_checkpoint,        # <- 여기 경로 문자열
+        backbone_weights=args.backbone_checkpoint,  # <- 여기 경로 문자열
+    )
+    model.to(device)
     if args.distributed:
         model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
     model.eval()
