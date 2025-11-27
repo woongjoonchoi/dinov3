@@ -318,6 +318,78 @@ class LocalGlobalHybridVisionTransformer(nn.Module):
         self.head = nn.Identity()
         self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
 
+    def _remap_pretrained_state_dict(self, state_dict: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """Remap original DINOv3 qkv/proj weights to the Baseline3 module layout.
+
+        When loading checkpoints from the global or window-only backbone, the attention
+        parameters live under ``attn.qkv`` and ``attn.proj``. Baseline3 splits the
+        attention into local, global, and patch-to-global branches, so we synthesize
+        the expected parameters from the original tensors and drop the old keys.
+
+        This keeps ``strict=True`` loading working for existing checkpoints.
+        """
+
+        def maybe_chunk_qkv(prefix: str):
+            qkv_w = state_dict.get(f"{prefix}attn.qkv.weight")
+            qkv_b = state_dict.get(f"{prefix}attn.qkv.bias")
+            if qkv_w is None or qkv_b is None:
+                return None
+            q_w, k_w, v_w = qkv_w.chunk(3, dim=0)
+            q_b, k_b, v_b = qkv_b.chunk(3, dim=0)
+            return (q_w, k_w, v_w, q_b, k_b, v_b)
+
+        remapped = dict(state_dict)
+        for i in range(len(self.blocks)):
+            prefix = f"blocks.{i}."
+            chunks = maybe_chunk_qkv(prefix)
+            if chunks is None:
+                continue
+            q_w, k_w, v_w, q_b, k_b, v_b = chunks
+
+            # Local branch weights
+            remapped.setdefault(f"{prefix}local_attn.q.weight", q_w.clone())
+            remapped.setdefault(f"{prefix}local_attn.q.bias", q_b.clone())
+            remapped.setdefault(f"{prefix}local_attn.k_local.weight", k_w.clone())
+            remapped.setdefault(f"{prefix}local_attn.k_local.bias", k_b.clone())
+            remapped.setdefault(f"{prefix}local_attn.v_local.weight", v_w.clone())
+            remapped.setdefault(f"{prefix}local_attn.v_local.bias", v_b.clone())
+            remapped.setdefault(f"{prefix}local_attn.k_global.weight", k_w.clone())
+            remapped.setdefault(f"{prefix}local_attn.k_global.bias", k_b.clone())
+            remapped.setdefault(f"{prefix}local_attn.v_global.weight", v_w.clone())
+            remapped.setdefault(f"{prefix}local_attn.v_global.bias", v_b.clone())
+
+            # Global branch weights
+            remapped.setdefault(f"{prefix}global_q.weight", q_w.clone())
+            remapped.setdefault(f"{prefix}global_q.bias", q_b.clone())
+            remapped.setdefault(f"{prefix}global_kv.weight", torch.cat((k_w, v_w), dim=0))
+            remapped.setdefault(f"{prefix}global_kv.bias", torch.cat((k_b, v_b), dim=0))
+            remapped.setdefault(f"{prefix}global_proj.weight", state_dict.get(f"{prefix}attn.proj.weight"))
+            remapped.setdefault(f"{prefix}global_proj.bias", state_dict.get(f"{prefix}attn.proj.bias"))
+
+            # Patch->global branch weights
+            remapped.setdefault(f"{prefix}patch_q.weight", q_w.clone())
+            remapped.setdefault(f"{prefix}patch_q.bias", q_b.clone())
+            remapped.setdefault(f"{prefix}patch_kv.weight", torch.cat((k_w, v_w), dim=0))
+            remapped.setdefault(f"{prefix}patch_kv.bias", torch.cat((k_b, v_b), dim=0))
+            remapped.setdefault(f"{prefix}patch_proj.weight", state_dict.get(f"{prefix}attn.proj.weight"))
+            remapped.setdefault(f"{prefix}patch_proj.bias", state_dict.get(f"{prefix}attn.proj.bias"))
+
+            # Local projection
+            remapped.setdefault(f"{prefix}local_attn.proj.weight", state_dict.get(f"{prefix}attn.proj.weight"))
+            remapped.setdefault(f"{prefix}local_attn.proj.bias", state_dict.get(f"{prefix}attn.proj.bias"))
+
+            # Remove old keys to avoid "unexpected" errors when strict=True
+            remapped.pop(f"{prefix}attn.qkv.weight", None)
+            remapped.pop(f"{prefix}attn.qkv.bias", None)
+            remapped.pop(f"{prefix}attn.proj.weight", None)
+            remapped.pop(f"{prefix}attn.proj.bias", None)
+
+        return remapped
+
+    def load_state_dict(self, state_dict: Dict[str, Tensor], strict: bool = True):
+        remapped = self._remap_pretrained_state_dict(state_dict)
+        return super().load_state_dict(remapped, strict=strict)
+
     def init_weights(self):
         self.rope_embed._init_weights()
         nn.init.normal_(self.cls_token, std=0.02)
