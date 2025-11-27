@@ -154,7 +154,15 @@ def _load_checkpoint(path: Path) -> dict:
 def _build_model_from_checkpoints(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
     model = detectors.dinov3_vit7b16_de(pretrained=False, weights="", backbone_weights="")
     detector_module = model.detector
-    backbone_module = detector_module.backbone[0].backbone
+    backbone_wrapper = detector_module.backbone[0]
+    if hasattr(backbone_wrapper, "backbone"):
+        backbone_module = backbone_wrapper.backbone
+    elif hasattr(backbone_wrapper, "_backbone"):
+        backbone_module = backbone_wrapper._backbone
+    else:
+        raise AttributeError(
+            "Backbone wrapper does not expose an inner backbone as 'backbone' or '_backbone'."
+        )
 
     backbone_state = _load_checkpoint(args.backbone_checkpoint)
     backbone_module.load_state_dict(backbone_state, strict=True)
