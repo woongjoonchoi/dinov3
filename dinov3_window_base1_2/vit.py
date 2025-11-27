@@ -1,3 +1,4 @@
+import logging
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
@@ -7,6 +8,8 @@ from torch import Tensor, nn
 from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
 from dinov3.utils import named_apply
 from dionv3_window.layers.window_block import WindowSelfAttentionBlock
+
+logger = logging.getLogger("dinov3")
 
 ffn_layer_dict = {
     "mlp": Mlp,
@@ -48,7 +51,7 @@ def init_weights_vit(module: nn.Module, name: str = ""):
         module.reset_parameters()
 
 
-class DinoVisionTransformerWindowBaseline1_1(nn.Module):
+class DinoVisionTransformerWindowLastGlobal(nn.Module):
     def __init__(
         self,
         *,
@@ -79,14 +82,13 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
         untie_cls_and_patch_norms: bool = False,
         untie_global_and_local_cls_norm: bool = True,
         window_size: int = 7,
-        global_block_indices: Optional[Sequence[int]] = None,
-        global_block_interval: int = 3,
+        num_last_global_blocks: int = 4,
         device: Any | None = None,
         **ignored_kwargs,
     ):
         super().__init__()
         if len(ignored_kwargs) > 0:
-            print(f"Ignored kwargs: {ignored_kwargs}")
+            logger.warning(f"Ignored kwargs: {ignored_kwargs}")
         del ignored_kwargs
 
         norm_layer_cls = norm_layer_dict[norm_layer]
@@ -96,6 +98,8 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
         self.num_heads = num_heads
         self.patch_size = patch_size
         self.window_size = window_size
+        self.num_last_global_blocks = max(0, min(num_last_global_blocks, depth))
+        self.global_block_start = depth - self.num_last_global_blocks
 
         self.patch_embed = PatchEmbed(
             img_size=img_size,
@@ -123,45 +127,15 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
             dtype=dtype_dict[pos_embed_rope_dtype],
             device=device,
         )
+
         ffn_layer_cls = ffn_layer_dict[ffn_layer]
         ffn_ratio_sequence = [ffn_ratio] * depth
-
-        if global_block_indices is not None:
-            global_block_set = set(global_block_indices)
-        else:
-            global_block_set = None
-
-        blocks_list = []
+        blocks_list: List[nn.Module] = []
         for i in range(depth):
-            is_global = False
-            if global_block_set is not None:
-                is_global = i in global_block_set
-            elif global_block_interval > 0:
-                is_global = (i + 1) % global_block_interval == 0
-
-            if is_global:
-                blocks_list.append(
-                    SelfAttentionBlock(
-                        dim=embed_dim,
-                        num_heads=num_heads,
-                        ffn_ratio=ffn_ratio_sequence[i],
-                        qkv_bias=qkv_bias,
-                        proj_bias=proj_bias,
-                        ffn_bias=ffn_bias,
-                        drop_path=drop_path_rate,
-                        norm_layer=norm_layer_cls,
-                        act_layer=nn.GELU,
-                        ffn_layer=ffn_layer_cls,
-                        init_values=layerscale_init,
-                        mask_k_bias=mask_k_bias,
-                        device=device,
-                    )
-                )
-            else:
+            if i < self.global_block_start:
                 shift_size = 0 if i % 2 == 0 else window_size // 2
                 blocks_list.append(
-                    _PatchOnlyWindowBlock(
-                        global_token_count=self.n_storage_tokens + 1,
+                    WindowSelfAttentionBlock(
                         dim=embed_dim,
                         num_heads=num_heads,
                         window_size=window_size,
@@ -176,6 +150,25 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
                         ffn_layer=ffn_layer_cls,
                         init_values=layerscale_init,
                         mask_k_bias=mask_k_bias,
+                        device=device,
+                    )
+                )
+            else:
+                blocks_list.append(
+                    SelfAttentionBlock(
+                        dim=embed_dim,
+                        num_heads=num_heads,
+                        ffn_ratio=ffn_ratio_sequence[i],
+                        qkv_bias=qkv_bias,
+                        proj_bias=proj_bias,
+                        ffn_bias=ffn_bias,
+                        drop=drop_path_rate,
+                        norm_layer=norm_layer_cls,
+                        act_layer=nn.GELU,
+                        ffn_layer=ffn_layer_cls,
+                        init_values=layerscale_init,
+                        mask_k_bias=mask_k_bias,
+                        drop_path=drop_path_rate,
                         device=device,
                     )
                 )
@@ -245,34 +238,43 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
             t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
             x.append(t2_x)
             hw_list.append(hw_tuple)
-        for blk in self.blocks:
-            if isinstance(blk, SelfAttentionBlock):
-                rope_sincos = [self.rope_embed(H=H, W=W) for H, W in hw_list]
-                x = blk(x, rope_sincos)
+        for idx, blk in enumerate(self.blocks):
+            if idx < self.global_block_start:
+                rope_sincos = [None for _ in hw_list]
+                updated_x = []
+                for tokens, _, hw in zip(x, rope_sincos, hw_list):
+                    global_tokens = tokens[:, : self.n_storage_tokens + 1]
+                    patch_tokens = tokens[:, self.n_storage_tokens + 1 :]
+                    patch_tokens = blk(patch_tokens, None, hw)
+                    updated_x.append(torch.cat([global_tokens, patch_tokens], dim=1))
+                x = updated_x
             else:
-                rope_sincos = [None for _ in x]
-                x = blk(x, rope_sincos, hw_list)
+                if self.rope_embed is not None:
+                    rope_sincos = [self.rope_embed(H=H, W=W) for H, W in hw_list]
+                else:
+                    rope_sincos = [None for _ in hw_list]
+                x = blk(x, rope_sincos)
         all_x = x
         output = []
-        for idx, (x, masks) in enumerate(zip(all_x, masks_list)):
+        for out_idx, (out_x, masks) in enumerate(zip(all_x, masks_list)):
             if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:
-                if self.untie_global_and_local_cls_norm and self.training and idx == 1:
-                    x_norm_cls_reg = self.local_cls_norm(x[:, : self.n_storage_tokens + 1])
+                if self.untie_global_and_local_cls_norm and self.training and out_idx == 1:
+                    out_norm_cls_reg = self.local_cls_norm(out_x[:, : self.n_storage_tokens + 1])
                 elif self.untie_cls_and_patch_norms:
-                    x_norm_cls_reg = self.cls_norm(x[:, : self.n_storage_tokens + 1])
+                    out_norm_cls_reg = self.cls_norm(out_x[:, : self.n_storage_tokens + 1])
                 else:
-                    x_norm_cls_reg = self.norm(x[:, : self.n_storage_tokens + 1])
-                x_norm_patch = self.norm(x[:, self.n_storage_tokens + 1 :])
+                    out_norm_cls_reg = self.norm(out_x[:, : self.n_storage_tokens + 1])
+                out_norm_patch = self.norm(out_x[:, self.n_storage_tokens + 1 :])
             else:
-                x_norm = self.norm(x)
-                x_norm_cls_reg = x_norm[:, : self.n_storage_tokens + 1]
-                x_norm_patch = x_norm[:, self.n_storage_tokens + 1 :]
+                out_norm = self.norm(out_x)
+                out_norm_cls_reg = out_norm[:, : self.n_storage_tokens + 1]
+                out_norm_patch = out_norm[:, self.n_storage_tokens + 1 :]
             output.append(
                 {
-                    "x_norm_clstoken": x_norm_cls_reg[:, 0],
-                    "x_storage_tokens": x_norm_cls_reg[:, 1:],
-                    "x_norm_patchtokens": x_norm_patch,
-                    "x_prenorm": x,
+                    "x_norm_clstoken": out_norm_cls_reg[:, 0],
+                    "x_storage_tokens": out_norm_cls_reg[:, 1:],
+                    "x_norm_patchtokens": out_norm_patch,
+                    "x_prenorm": out_x,
                     "masks": masks,
                 }
             )
@@ -289,12 +291,15 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
         output, total_block_len = [], len(self.blocks)
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         for i, blk in enumerate(self.blocks):
-            if isinstance(blk, SelfAttentionBlock):
-                rope_sincos = self.rope_embed(H=H, W=W)
-                x = blk(x, rope_sincos)
-            else:
+            if i < self.global_block_start:
                 rope_sincos = None
-                x = blk(x, rope_sincos, (H, W))
+                global_tokens = x[:, : self.n_storage_tokens + 1]
+                patch_tokens = x[:, self.n_storage_tokens + 1 :]
+                patch_tokens = blk(patch_tokens, rope_sincos, (H, W))
+                x = torch.cat([global_tokens, patch_tokens], dim=1)
+            else:
+                rope_sincos = self.rope_embed(H=H, W=W) if self.rope_embed is not None else None
+                x = blk(x, rope_sincos)
             if i in blocks_to_take:
                 output.append(x)
         assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
@@ -343,78 +348,4 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
         return self.forward_features(x, masks)
 
 
-class _PatchOnlyWindowBlock(nn.Module):
-    """Window attention applied only to patch tokens.
-
-    CLS/storage tokens bypass the attention and FFN and are forwarded unchanged, so
-    they are effectively used only in global blocks.
-    """
-
-    def __init__(
-        self,
-        *,
-        global_token_count: int,
-        dim: int,
-        num_heads: int,
-        window_size: int,
-        shift_size: int,
-        ffn_ratio: float,
-        qkv_bias: bool,
-        proj_bias: bool,
-        ffn_bias: bool,
-        drop: float,
-        norm_layer,
-        act_layer,
-        ffn_layer,
-        init_values,
-        mask_k_bias,
-        device,
-    ) -> None:
-        super().__init__()
-        self.global_token_count = global_token_count
-        self.patch_block = WindowSelfAttentionBlock(
-            dim=dim,
-            num_heads=num_heads,
-            window_size=window_size,
-            shift_size=shift_size,
-            ffn_ratio=ffn_ratio,
-            qkv_bias=qkv_bias,
-            proj_bias=proj_bias,
-            ffn_bias=ffn_bias,
-            drop=drop,
-            norm_layer=norm_layer,
-            act_layer=act_layer,
-            ffn_layer=ffn_layer,
-            init_values=init_values,
-            mask_k_bias=mask_k_bias,
-            device=device,
-        )
-
-    def _forward_single(self, x: Tensor, rope, hw: Tuple[int, int]) -> Tensor:
-        g_tokens = x[:, : self.global_token_count]
-        p_tokens = x[:, self.global_token_count :]
-        p_tokens = self.patch_block(p_tokens, rope, hw)
-        return torch.cat([g_tokens, p_tokens], dim=1)
-
-    def forward(
-        self,
-        x_or_x_list,
-        rope_or_rope_list=None,
-        hw_or_hw_list: Optional[List[Tuple[int, int]] | Tuple[int, int]] = None,
-    ):
-        if isinstance(x_or_x_list, Tensor):
-            assert isinstance(hw_or_hw_list, tuple)
-            return self._forward_single(x_or_x_list, rope_or_rope_list, hw_or_hw_list)
-        elif isinstance(x_or_x_list, list):
-            if rope_or_rope_list is None:
-                rope_or_rope_list = [None for _ in x_or_x_list]
-            assert isinstance(hw_or_hw_list, list)
-            return [
-                self._forward_single(x, rope, hw)
-                for x, hw, rope in zip(x_or_x_list, hw_or_hw_list, rope_or_rope_list)
-            ]
-        else:
-            raise AssertionError
-
-
-__all__ = ["DinoVisionTransformerWindowBaseline1_1"]
+__all__ = ["DinoVisionTransformerWindowLastGlobal"]
