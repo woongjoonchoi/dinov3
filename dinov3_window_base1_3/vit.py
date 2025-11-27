@@ -614,6 +614,9 @@ class WindowSelfAttentionWithGlobal(nn.Module):
         q_dtype = q.dtype
         k_dtype = k.dtype
         sin, cos = rope
+        if sin.dim() == 3:
+            sin = sin.unsqueeze(1)
+            cos = cos.unsqueeze(1)
         rope_dtype = sin.dtype
         q = q.to(dtype=rope_dtype)
         k = k.to(dtype=rope_dtype)
