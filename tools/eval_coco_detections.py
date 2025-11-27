@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import json
+import os
 from pathlib import Path
 from typing import Iterable, List, Tuple
 
@@ -21,7 +22,7 @@ from torchvision.transforms import functional as F
 from torchvision.transforms.functional import InterpolationMode
 from tqdm import tqdm
 
-from dinov3.hub import backbones, detectors
+from dinov3.hub import detectors
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
@@ -133,10 +134,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
     parser.add_argument("--max-size", type=int, default=None, help="Optional maximum size for the shortest image side; keeps aspect ratio.")
     parser.add_argument("--score-threshold", type=float, default=0.0, help="Discard predictions below this confidence.")
-    parser.add_argument("--detector-weights", default=detectors.DetectionWeights.COCO2017, help="Detector checkpoint to use.")
-    parser.add_argument("--backbone-weights", default=backbones.Weights.LVD1689M, help="Backbone checkpoint to use.")
+    parser.add_argument(
+        "--backbone-checkpoint",
+        type=Path,
+        required=True,
+        help="Path to the pretrained backbone checkpoint to load directly.",
+    )
+    parser.add_argument(
+        "--detector-checkpoint",
+        type=Path,
+        required=True,
+        help="Path to the detector head checkpoint to load directly.",
+    )
     parser.add_argument("--output-json", default="coco_predictions.json", help="Where to store raw COCO-format predictions.")
     return parser.parse_args()
+
+
+def _load_checkpoint(path: Path) -> dict:
+    checkpoint = torch.load(path, map_location="cpu")
+    if isinstance(checkpoint, dict):
+        for key in ("model", "state_dict", "model_state_dict", "model_state"):
+            if key in checkpoint:
+                checkpoint = checkpoint[key]
+                break
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"Unexpected checkpoint structure in {path}")
+    if any(k.startswith("module.") for k in checkpoint):
+        checkpoint = {k.removeprefix("module."): v for k, v in checkpoint.items()}
+    return checkpoint
+
+
+def _build_model_from_checkpoints(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
+    model = detectors.dinov3_vit7b16_de(pretrained=False, weights="", backbone_weights="")
+    detector_module = model.detector
+    backbone_module = detector_module.backbone[0].backbone
+
+    backbone_state = _load_checkpoint(args.backbone_checkpoint)
+    backbone_module.load_state_dict(backbone_state, strict=True)
+
+    detector_state = _load_checkpoint(args.detector_checkpoint)
+    detector_module.load_state_dict(detector_state, strict=False)
+
+    model.to(device)
+    return model
 
 
 def main() -> None:
@@ -169,6 +209,11 @@ def main() -> None:
     if not image_root.exists():
         raise FileNotFoundError(f"Image directory not found: {image_root}")
 
+    if not args.backbone_checkpoint.exists():
+        raise FileNotFoundError(f"Backbone checkpoint not found: {args.backbone_checkpoint}")
+    if not args.detector_checkpoint.exists():
+        raise FileNotFoundError(f"Detector checkpoint not found: {args.detector_checkpoint}")
+
     dataset = CocoDetectionForEval(
         root=str(image_root), ann_file=str(ann_file), transform=build_transform(), max_size=args.max_size
     )
@@ -190,10 +235,7 @@ def main() -> None:
         shuffle=False,
         pin_memory=args.pin_memory,
     )
-    model = detectors.dinov3_vit7b16_de(
-        pretrained=True, weights=args.detector_weights, backbone_weights=args.backbone_weights
-    )
-    model.to(device)
+    model = _build_model_from_checkpoints(args, device)
     if args.distributed:
         model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
     model.eval()
