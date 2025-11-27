@@ -5,9 +5,9 @@ import torch
 from torch import Tensor, nn
 
 from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SwiGLUFFN
-from dinov3.layers.attention import LinearKMaskedBias
+from dinov3.layers.attention import rope_apply
 from dinov3.utils import named_apply
-from dionv3_window.layers.window_attention import WindowSelfAttention
+from dionv3_window.layers.window_attention import window_partition, window_reverse
 
 
 ffn_layer_dict = {
@@ -80,7 +80,7 @@ class LocalGlobalBlock(nn.Module):
         self.shift_size = shift_size
 
         self.norm1 = norm_layer(dim)
-        self.local_attn = WindowSelfAttention(
+        self.local_attn = WindowSelfAttentionWithGlobal(
             dim,
             num_heads=num_heads,
             window_size=window_size,
@@ -93,16 +93,17 @@ class LocalGlobalBlock(nn.Module):
             device=device,
         )
 
-        linear_class = LinearKMaskedBias if mask_k_bias else nn.Linear
+        linear_q_class = nn.Linear
+        linear_kv_class = nn.Linear
 
-        self.global_q = linear_class(dim, dim, bias=qkv_bias, device=device)
-        self.global_kv = linear_class(dim, dim * 2, bias=qkv_bias, device=device)
+        self.global_q = linear_q_class(dim, dim, bias=qkv_bias, device=device)
+        self.global_kv = linear_kv_class(dim, dim * 2, bias=qkv_bias, device=device)
         self.global_proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
 
         self.enable_patch_to_global = enable_patch_to_global
         if enable_patch_to_global:
-            self.patch_q = linear_class(dim, dim, bias=qkv_bias, device=device)
-            self.patch_kv = linear_class(dim, dim * 2, bias=qkv_bias, device=device)
+            self.patch_q = linear_q_class(dim, dim, bias=qkv_bias, device=device)
+            self.patch_kv = linear_kv_class(dim, dim * 2, bias=qkv_bias, device=device)
             self.patch_proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
         else:
             self.patch_q = None
@@ -156,11 +157,18 @@ class LocalGlobalBlock(nn.Module):
         assert N >= self.num_global_tokens
         x_norm = self.norm1(x)
 
-        local_out = self.local_attn(x_norm, hw=hw, rope=rope)
-        patch_local = local_out[:, self.num_global_tokens :, :]
+        global_tokens = x_norm[:, : self.num_global_tokens, :]
+        patch_tokens = x_norm[:, self.num_global_tokens :, :]
 
-        kv_tokens = torch.cat((x_norm[:, : self.num_global_tokens, :], patch_local), dim=1)
-        global_out = self._global_attention(x_norm[:, : self.num_global_tokens, :], kv_tokens)
+        patch_local = self.local_attn(
+            patch_tokens,
+            hw=hw,
+            rope=rope,
+            global_tokens=global_tokens,
+        )
+
+        kv_tokens = torch.cat((global_tokens, patch_local), dim=1)
+        global_out = self._global_attention(global_tokens, kv_tokens)
 
         patch_global = self._patch_global_attention(patch_local, global_out)
         patch_out = patch_local + patch_global
@@ -448,3 +456,140 @@ class LocalGlobalHybridVisionTransformer(nn.Module):
 
 
 __all__ = ["LocalGlobalHybridVisionTransformer"]
+class WindowSelfAttentionWithGlobal(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        window_size: int = 7,
+        shift_size: int = 0,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        mask_k_bias: bool = False,
+        device=None,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+
+        head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
+
+        linear_q_class = nn.Linear
+        linear_kv_class = nn.Linear
+        self.q = linear_q_class(dim, dim, bias=qkv_bias, device=device)
+        self.k_local = linear_kv_class(dim, dim, bias=qkv_bias, device=device)
+        self.v_local = linear_kv_class(dim, dim, bias=qkv_bias, device=device)
+        self.k_global = linear_kv_class(dim, dim, bias=qkv_bias, device=device)
+        self.v_global = linear_kv_class(dim, dim, bias=qkv_bias, device=device)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def get_attention_mask(self, H: int, W: int, device, dtype, batch_size: int) -> Tensor:
+        img_mask = torch.zeros((1, H, W, 1), device=device)
+        cnt = 0
+        for h in range(0, H, self.window_size):
+            for w in range(0, W, self.window_size):
+                img_mask[:, h : h + self.window_size, w : w + self.window_size, :] = cnt
+                cnt += 1
+        shifted_mask = torch.roll(img_mask, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        mask_windows = window_partition(shifted_mask, self.window_size).view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float("-inf"))
+        attn_mask = attn_mask.masked_fill(attn_mask == 0, 0)
+        attn_mask = attn_mask.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+        return attn_mask.reshape(-1, self.window_size * self.window_size, self.window_size * self.window_size).to(dtype)
+
+    def apply_rope(self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+        q_dtype = q.dtype
+        k_dtype = k.dtype
+        sin, cos = rope
+        rope_dtype = sin.dtype
+        q = q.to(dtype=rope_dtype)
+        k = k.to(dtype=rope_dtype)
+        N = q.shape[-2]
+        prefix = N - sin.shape[-2]
+        assert prefix >= 0
+        q_prefix = q[:, :, :prefix, :]
+        q = rope_apply(q[:, :, prefix:, :], sin, cos)
+        q = torch.cat((q_prefix, q), dim=-2)
+        k_prefix = k[:, :, :prefix, :]
+        k = rope_apply(k[:, :, prefix:, :], sin, cos)
+        k = torch.cat((k_prefix, k), dim=-2)
+        q = q.to(dtype=q_dtype)
+        k = k.to(dtype=k_dtype)
+        return q, k
+
+    def forward(
+        self,
+        patch_tokens: Tensor,
+        hw: Tuple[int, int],
+        rope: Tensor | Tuple[Tensor, Tensor] | None = None,
+        global_tokens: Tensor | None = None,
+    ) -> Tensor:
+        B, N, C = patch_tokens.shape
+        H, W = hw
+        assert N == H * W, "patch tokens must match spatial dims"
+
+        patch_tokens = patch_tokens.view(B, H, W, C)
+        if self.shift_size > 0:
+            shifted_tokens = torch.roll(patch_tokens, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_tokens = patch_tokens
+
+        patch_windows = window_partition(shifted_tokens, self.window_size)
+        num_windows = patch_windows.shape[0] // B
+
+        attn_mask = None
+        if self.shift_size > 0:
+            attn_mask_local = self.get_attention_mask(H, W, patch_tokens.device, patch_tokens.dtype, B)
+            if global_tokens is not None:
+                zeros_for_global = torch.zeros(
+                    attn_mask_local.shape[0],
+                    attn_mask_local.shape[1],
+                    global_tokens.shape[1],
+                    device=attn_mask_local.device,
+                    dtype=attn_mask_local.dtype,
+                )
+                attn_mask = torch.cat([attn_mask_local, zeros_for_global], dim=-1)
+            else:
+                attn_mask = attn_mask_local
+            attn_mask = attn_mask.unsqueeze(1)
+
+        q = self.q(patch_windows).reshape(B * num_windows, self.window_size * self.window_size, self.num_heads, C // self.num_heads)
+        k_local = self.k_local(patch_windows).reshape(B * num_windows, self.window_size * self.window_size, self.num_heads, C // self.num_heads)
+        v_local = self.v_local(patch_windows).reshape(B * num_windows, self.window_size * self.window_size, self.num_heads, C // self.num_heads)
+
+        k_list = [k_local]
+        v_list = [v_local]
+        if global_tokens is not None:
+            global_kv = global_tokens[:, None].expand(B, num_windows, -1, -1).reshape(B * num_windows, -1, C)
+            k_global = self.k_global(global_kv).reshape(B * num_windows, global_tokens.shape[1], self.num_heads, C // self.num_heads)
+            v_global = self.v_global(global_kv).reshape(B * num_windows, global_tokens.shape[1], self.num_heads, C // self.num_heads)
+            k_list.append(k_global)
+            v_list.append(v_global)
+
+        q = q.transpose(1, 2)
+        k = torch.cat(k_list, dim=1).transpose(1, 2)
+        v = torch.cat(v_list, dim=1).transpose(1, 2)
+
+        if rope is not None:
+            q, k = self.apply_rope(q, k, rope)
+
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        x = x.transpose(1, 2)
+        x = x.reshape(B * num_windows, self.window_size * self.window_size, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        merged = window_reverse(x, self.window_size, H, W, B)
+        if self.shift_size > 0:
+            merged = torch.roll(merged, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        merged = merged.view(B, H * W, C)
+        return merged
+
