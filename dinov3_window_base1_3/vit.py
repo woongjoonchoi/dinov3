@@ -618,8 +618,12 @@ class WindowSelfAttentionWithGlobal(nn.Module):
         q = q.to(dtype=rope_dtype)
         k = k.to(dtype=rope_dtype)
         N = q.shape[-2]
-        prefix = N - sin.shape[-2]
-        assert prefix >= 0
+        sin_len = sin.shape[-2]
+        if sin_len > N:
+            sin = sin[:, :, sin_len - N :, :]
+            cos = cos[:, :, sin_len - N :, :]
+            sin_len = N
+        prefix = N - sin_len
         q_prefix = q[:, :, :prefix, :]
         q = rope_apply(q[:, :, prefix:, :], sin, cos)
         q = torch.cat((q_prefix, q), dim=-2)
@@ -646,6 +650,25 @@ class WindowSelfAttentionWithGlobal(nn.Module):
             shifted_tokens = torch.roll(patch_tokens, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
             shifted_tokens = patch_tokens
+
+        rope_windows = None
+        if rope is not None:
+            sin, cos = rope
+            sin = sin.view(1, H, W, -1)
+            cos = cos.view(1, H, W, -1)
+            if self.shift_size > 0:
+                sin = torch.roll(sin, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+                cos = torch.roll(cos, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            sin_windows = window_partition(sin, self.window_size).view(-1, self.window_size * self.window_size, sin.shape[-1])
+            cos_windows = window_partition(cos, self.window_size).view(-1, self.window_size * self.window_size, cos.shape[-1])
+            num_windows = sin_windows.shape[0]
+            sin_windows = sin_windows.expand(B, num_windows, -1, -1).reshape(
+                B * num_windows, self.window_size * self.window_size, sin.shape[-1]
+            )
+            cos_windows = cos_windows.expand(B, num_windows, -1, -1).reshape(
+                B * num_windows, self.window_size * self.window_size, cos.shape[-1]
+            )
+            rope_windows = (sin_windows, cos_windows)
 
         patch_windows = window_partition(shifted_tokens, self.window_size)
         num_windows = patch_windows.shape[0] // B
@@ -683,8 +706,8 @@ class WindowSelfAttentionWithGlobal(nn.Module):
         k = torch.cat(k_list, dim=1).transpose(1, 2)
         v = torch.cat(v_list, dim=1).transpose(1, 2)
 
-        if rope is not None:
-            q, k = self.apply_rope(q, k, rope)
+        if rope_windows is not None:
+            q, k = self.apply_rope(q, k, rope_windows)
 
         x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         x = x.transpose(1, 2)
