@@ -10,7 +10,7 @@ import argparse
 import os
 import pathlib
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
 import torch
 import torch.distributed as dist
@@ -152,12 +152,22 @@ def _load_linear_head_state(path: pathlib.Path, device: torch.device) -> dict:
 
 
 def _train_one_epoch(
-    model: torch.nn.Module, loader: DataLoader, device: torch.device, optimizer: torch.optim.Optimizer, *, world_size: int
-) -> float:
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    *,
+    world_size: int,
+    start_step: int,
+    log_metrics: Callable[[dict, int | None], None] | None,
+    epoch: int,
+) -> tuple[float, int]:
     criterion = torch.nn.CrossEntropyLoss()
     model.train()
     total_loss = torch.tensor(0.0, device=device)
     total_samples = torch.tensor(0, device=device)
+    global_step = start_step
+
     for activations, targets in tqdm(loader, desc="train"):
         activations = activations.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
@@ -172,10 +182,20 @@ def _train_one_epoch(
         total_loss += loss.detach() * batch_size
         total_samples += batch_size
 
+        step_loss = loss.detach()
+        if world_size > 1:
+            step_loss = step_loss.clone()
+            dist.all_reduce(step_loss, op=dist.ReduceOp.SUM)
+            step_loss /= world_size
+        if log_metrics is not None:
+            log_metrics({"train/loss": step_loss.item(), "epoch": epoch}, step=global_step + 1)
+
+        global_step += 1
+
     if world_size > 1:
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
-    return (total_loss / total_samples).item()
+    return (total_loss / total_samples).item(), global_step
 
 
 @torch.inference_mode()
@@ -275,15 +295,26 @@ def main() -> None:
     is_main_process = not distributed or dist.get_rank() == 0
     wandb = _init_wandb(args, meta) if is_main_process else None
 
+    log_metrics = (lambda metrics, step=None: wandb.log(metrics, step=step)) if wandb is not None else None
+    global_step = 0
     for epoch in range(1, args.epochs + 1):
         if distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        train_loss = _train_one_epoch(model, train_loader, device, optimizer, world_size=world_size)
+        train_loss, global_step = _train_one_epoch(
+            model,
+            train_loader,
+            device,
+            optimizer,
+            world_size=world_size,
+            start_step=global_step,
+            log_metrics=log_metrics if is_main_process else None,
+            epoch=epoch,
+        )
         val_loss = _evaluate(model, val_loader, device, world_size=world_size)
         if is_main_process:
             print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
             if wandb is not None:
-                wandb.log({"train/loss": train_loss, "val/loss": val_loss, "epoch": epoch})
+                wandb.log({"val/loss": val_loss, "epoch": epoch}, step=global_step)
 
     if is_main_process:
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
