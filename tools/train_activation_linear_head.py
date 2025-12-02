@@ -308,10 +308,17 @@ def _train_one_epoch(
 
 
 @torch.inference_mode()
-def _evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device, *, world_size: int) -> float:
+def _evaluate(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    world_size: int,
+) -> tuple[float, float]:
     criterion = torch.nn.CrossEntropyLoss()
     model.eval()
     total_loss = torch.tensor(0.0, device=device)
+    total_correct = torch.tensor(0, device=device)
     total_samples = torch.tensor(0, device=device)
     for activations, targets in tqdm(loader, desc="val"):
         activations = activations.to(device, non_blocking=True)
@@ -319,13 +326,19 @@ def _evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device, 
         logits = model(activations)
         loss = criterion(logits, targets)
         batch_size = targets.size(0)
+        preds = logits.argmax(dim=1)
+        total_correct += (preds == targets).sum()
         total_loss += loss * batch_size
         total_samples += batch_size
 
     if world_size > 1:
         dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_correct, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
-    return (total_loss / total_samples).item()
+
+    avg_loss = (total_loss / total_samples).item()
+    accuracy = (total_correct.float() / total_samples).item()
+    return avg_loss, accuracy
 
 
 def main() -> None:
@@ -421,11 +434,14 @@ def main() -> None:
             log_metrics=log_metrics if is_main_process else None,
             epoch=epoch,
         )
-        val_loss = _evaluate(model, val_loader, device, world_size=world_size)
+        val_loss, val_acc = _evaluate(model, val_loader, device, world_size=world_size)
         if is_main_process:
-            print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
+            print(
+                f"Epoch {epoch}: train_loss={train_loss:.4f}, "
+                f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}"
+            )
             if wandb is not None:
-                wandb.log({"val/loss": val_loss, "epoch": epoch}, step=global_step)
+                wandb.log({"val/loss": val_loss, "val/acc": val_acc, "epoch": epoch}, step=global_step)
 
     if is_main_process:
         # args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
