@@ -10,7 +10,7 @@ dist/
 
 # Ignore shell scripts
 *.sh
-!docker/*.sh
+docker/*.sh
 
 # Ignore swap files
 *.swp

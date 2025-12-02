@@ -99,7 +99,8 @@ class DinoVisionTransformerWindowLastGlobal(nn.Module):
         self.patch_size = patch_size
         self.window_size = window_size
         self.num_last_global_blocks = max(0, min(num_last_global_blocks, depth))
-        self.global_block_start = depth - self.num_last_global_blocks
+        # self.global_block_start = depth - self.num_last_global_blocks
+        self.global_block_start = self.num_last_global_blocks
         print(f"global block_start :{self.global_block_start}")
         self.patch_embed = PatchEmbed(
             img_size=img_size,

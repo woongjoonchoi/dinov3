@@ -77,6 +77,87 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--local-rank", type=int, default=None, help="Local rank provided by torchrun for DDP training.")
     return parser.parse_args()
 
+def resolve_checkpoint_path(args: argparse.Namespace) -> pathlib.Path:
+    """
+    --checkpoint 가 '디렉토리' 로 들어오면:
+      /ckpt/{run_name}/linear_head.pth
+    --checkpoint 가 '파일경로' 로 들어오면:
+      그대로 사용
+
+    예)
+      --checkpoint /ckpt
+        -> /ckpt/{run_name}/linear_head.pth
+
+      --checkpoint /ckpt/foo/bar.pth
+        -> /ckpt/foo/bar.pth
+    """
+    ckpt = args.checkpoint
+
+    # 1) wandb_run_name 우선, 없으면 기본 규칙으로 생성
+    run_name = args.wandb_run_name or make_wandb_run_name(args)
+
+    # 2) checkpoint가 디렉토리처럼 들어온 경우 처리
+    #    (확장자가 없고, 혹은 실제로 디렉토리인 경우)
+    is_dir_like = (ckpt.suffix == "")  # ".pth" 같은 suffix 없음
+    # 컨테이너 안에서 /ckpt 는 이미 디렉토리니까, 있으면 is_dir로도 체크
+    if ckpt.exists() and ckpt.is_dir():
+        is_dir_like = True
+
+    if is_dir_like:
+        ckpt_dir = ckpt / run_name
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_dir / "linear_head.pth"
+    else:
+        ckpt_dir = ckpt.parent
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt
+
+    return ckpt_path
+
+def infer_dataset_name(train_dir: pathlib.Path) -> str:
+    """
+    /path/to/.../imagenet1k/train 이런 구조라고 가정하면,
+    'imagenet1k' 를 뽑아내는 헬퍼.
+    """
+    parent = train_dir.parent  # 보통 'train'
+    if parent.name in {"train", "val"} and parent.parent.name:
+        return parent.parent.name  # 'imagenet1k'
+    return parent.name  # fallback
+
+
+def make_wandb_run_name(args: argparse.Namespace) -> str:
+    # 1) 고정 prefix: 실험 타입
+    prefix = getattr(args, "experiment_name", "g2w-lh")  # 없으면 g2w-lh
+
+    # 2) dataset / backbone / baseline 같은 high-level 정보
+    dataset = infer_dataset_name(args.train_dir)
+    backbone = getattr(args, "backbone", None)          # 있으면 사용
+    baseline = getattr(args, "baseline", None)          # 예: b1, b2, b3
+    feat_type = getattr(args, "feat_type", None)        # 예: cls+gap, cls-only
+
+    parts = [prefix, dataset]
+
+    if backbone:
+        parts.append(backbone)
+    if baseline:
+        parts.append(baseline)
+    if feat_type:
+        parts.append(feat_type)
+
+    # 3) 핵심 하이퍼파라미터
+    parts.append(f"ep{args.epochs}")
+    parts.append(f"bs{args.batch_size}")
+    parts.append(f"lr{args.learning_rate:g}")
+
+    if args.weight_decay > 0:
+        parts.append(f"wd{args.weight_decay:g}")
+
+    seed = getattr(args, "seed", None)
+    if seed is not None:
+        parts.append(f"s{seed}")
+
+    return "_".join(parts)
+
 
 @dataclass
 class _RunMetadata:
@@ -222,6 +303,8 @@ def _evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device, 
 def main() -> None:
     args = _parse_args()
     local_rank = args.local_rank
+    if args.wandb_run_name is None :
+        args.wandb_run_name = make_wandb_run_name(args)
     if local_rank is None:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
@@ -317,11 +400,12 @@ def main() -> None:
                 wandb.log({"val/loss": val_loss, "epoch": epoch}, step=global_step)
 
     if is_main_process:
-        args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        # args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        ckpt_path = resolve_checkpoint_path(args)
         to_save = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-        torch.save(to_save, args.checkpoint)
+        torch.save(to_save, ckpt_path)
         if wandb is not None:
-            wandb.save(str(args.checkpoint))
+            wandb.save(str(ckpt_path))
 
     if distributed:
         dist.destroy_process_group()

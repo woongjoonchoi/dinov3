@@ -23,9 +23,38 @@ from torchvision.transforms.functional import InterpolationMode
 from tqdm import tqdm
 
 from dinov3.hub import detectors
+from dinov3.eval.detection.models.detr import  PostProcess
 
+from torch import nn
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
+
+
+class DetectorWithProcessor(nn.Module):
+    def __init__(self, detector, postprocessor):
+        super().__init__()
+        self.detector = detector          # PlainDETRReParam
+        self.postprocessor = postprocessor  # PostProcess(reparam=True)
+
+    def forward(self, samples: list[Tensor], metas: list[dict]):
+        outputs = self.detector(samples)
+
+        resized_sizes = torch.tensor(
+            [m["resized_size"] for m in metas],
+            device=samples[0].device,
+            dtype=outputs["pred_boxes"].dtype,
+        )
+        orig_sizes = torch.tensor(
+            [m["orig_size"] for m in metas],
+            device=samples[0].device,
+            dtype=outputs["pred_boxes"].dtype,
+        )
+
+        return self.postprocessor(
+            outputs,
+            target_sizes=resized_sizes,
+            original_target_sizes=orig_sizes,
+        )
 
 
 class ResizeShortSide:
@@ -234,6 +263,16 @@ def main() -> None:
 
     id_map = coco_id_mapping(dataset.coco)
 
+    # ckpt = torch.load(args.detector_checkpoint, map_location="cpu")
+
+    # print(ckpt.keys())  # 보통 'model', 'args', 'epoch', ... 이런거 있음
+
+    # adv = ckpt.get("advance", None)
+    # print(type(adv))
+    # if isinstance(adv, dict):
+    #     print("advance keys:", adv.keys())
+
+    # exit()
     sampler = None
     if args.distributed:
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -250,16 +289,65 @@ def main() -> None:
         pin_memory=args.pin_memory,
     )
     # model = _build_model_from_checkpoints(args, device)
-    model = detectors.dinov3_vit7b16_de(
-        pretrained=False,  # 이미 weights를 직접 주니까 굳이 True일 필요 없음
-        weights=args.detector_checkpoint,        # <- 여기 경로 문자열
-        backbone_weights=args.backbone_checkpoint,  # <- 여기 경로 문자열
-    )
+    # model = detectors.dinov3_vit7b16_de(
+    #     pretrained=True,  # 이미 weights를 직접 주니까 굳이 True일 필요 없음
+    #     weights=str(args.detector_checkpoint),        # <- 여기 경로 문자열
+    #     backbone_weights=str(args.backbone_checkpoint),  # <- 여기 경로 문자열
+    # )
+    
+    hub_model = torch.hub.load(
+        '/app', 
+        'dinov3_vit7b16_de',
+          source="local", 
+          weights=str(args.detector_checkpoint), 
+          backbone_weights=str(args.backbone_checkpoint))
+    detector = hub_model.detector  # 또는 hub_model 자체
+    postprocessor = PostProcess(topk=100, reparam=True)
+
+    model = DetectorWithProcessor(detector, postprocessor)
     model.to(device)
+    
     if args.distributed:
         model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
     model.eval()
 
+    # # 1) 데이터셋에서 한 샘플 뽑기
+    # idx = 0  # 아무거나
+    # img, meta = dataset[idx]
+    # print("meta:", meta)
+
+    # img_id = meta["image_id"]
+    # h_orig, w_orig = meta["orig_size"]
+    # h_resized, w_resized = meta["resized_size"]
+    # print("orig_size   :", h_orig, w_orig)
+    # print("resized_size:", h_resized, w_resized)
+    # print("tensor shape:", img.shape)  # (3, H_resized, W_resized)
+
+    # # 2) GT 박스 확인
+    # ann_ids = dataset.coco.getAnnIds(imgIds=[img_id])
+    # anns = dataset.coco.loadAnns(ann_ids)
+    # print(f"#GT boxes for image_id={img_id}: {len(anns)}")
+    # for a in anns[:5]:
+    #     print("GT bbox (x,y,w,h):", a["bbox"], "category_id:", a["category_id"])
+
+    # # 3) 모델 prediction 한 장만
+    # model.eval()
+    # with torch.no_grad():
+    #     # 여기서 model은 DDP 감싸기 전 기준 (DDP면 model.module)
+    #     out = model([img.to(device)], [meta])[0]   # DetectorWithProcessor가 (images, metas)를 받도록 한 버전 기준
+
+    # boxes  = out["boxes"].cpu()
+    # scores = out["scores"].cpu()
+    # labels = out["labels"].cpu()
+
+    # print("pred boxes shape:", boxes.shape)   # K x 4
+    # print("top5 scores:", scores[:5])
+    # print("top5 boxes:", boxes[:5])
+    # print("top5 labels:", labels[:5])
+    # print("boxes min/max x:", boxes[:, [0, 2]].min().item(), boxes[:, [0, 2]].max().item())
+    # print("boxes min/max y:", boxes[:, [1, 3]].min().item(), boxes[:, [1, 3]].max().item())
+
+    # exit()
     predictions_all: List[dict] = []
 
     with torch.no_grad():
@@ -267,22 +355,27 @@ def main() -> None:
             tqdm(dataloader, desc="Evaluating", total=len(dataloader)), start=1
         ):
             inputs = [img.to(device) for img in images]
-            outputs = model(inputs)
-
+            outputs = model(inputs,metas)
+            # outputs = model(inputs)
             batch_predictions: List[dict] = []
+            # print(outputs[0].keys())        # boxes, scores, labels?
+            # print(outputs[0]["boxes"][:5])
+            # print(outputs[0]["labels"][:5])
+            # print(outputs[0]["scores"][:5])
+            # exit()
             for output, meta in zip(outputs, metas):
                 boxes = output["boxes"].cpu()
                 scores = output["scores"].cpu()
                 labels = output["labels"].cpu()
 
-                h_orig, w_orig = meta["orig_size"]
-                h_resized, w_resized = meta["resized_size"]
-                scale_x = w_orig / w_resized
-                scale_y = h_orig / h_resized
+                # h_orig, w_orig = meta["orig_size"]
+                # h_resized, w_resized = meta["resized_size"]
+                # scale_x = w_orig / w_resized
+                # scale_y = h_orig / h_resized
 
-                boxes = boxes.clone()
-                boxes[:, [0, 2]] *= scale_x
-                boxes[:, [1, 3]] *= scale_y
+                # boxes = boxes.clone()
+                # boxes[:, [0, 2]] *= scale_x
+                # boxes[:, [1, 3]] *= scale_y
 
                 for box, score, label in zip(boxes, scores, labels):
                     if score < args.score_threshold:
@@ -293,7 +386,8 @@ def main() -> None:
                     batch_predictions.append(
                         {
                             "image_id": meta["image_id"],
-                            "category_id": id_map.get(int(label), int(label)),
+                            # "category_id": id_map.get(int(label), int(label)),
+                            "category_id": int(label),
                             "bbox": coco_box,
                             "score": float(score),
                         }
@@ -306,12 +400,12 @@ def main() -> None:
                     merged_batch = [pred for sublist in gathered_batches for pred in sublist]
                     predictions_all.extend(merged_batch)
                     evaluate_predictions_with_logging(
-                        dataset.coco, merged_batch, iteration=iteration, require_nonempty=False
+                        dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
                     )
             else:
                 predictions_all.extend(batch_predictions)
                 evaluate_predictions_with_logging(
-                    dataset.coco, batch_predictions, iteration=iteration, require_nonempty=False
+                    dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
                 )
 
     if not args.distributed or rank == 0:

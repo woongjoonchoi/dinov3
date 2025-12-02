@@ -317,6 +317,7 @@ class LocalGlobalHybridVisionTransformer(nn.Module):
             self.local_cls_norm = None
         self.head = nn.Identity()
         self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
+        print(f"baseline 1_3 ")
 
     def _normalize_state_dict(self, state_dict: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """Strip common wrappers (DDP/module/backbone prefixes) from checkpoint keys."""

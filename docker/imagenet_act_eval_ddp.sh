@@ -33,6 +33,19 @@ bash  docker/imagenet_act_eval_ddp.sh  \
   --device cuda \
   --distributed 
 
+bash  docker/imagenet_act_eval_ddp.sh  \
+  --gpus all \
+    --shm-size=120g \
+   -v ~/imagenet_act/imagenet-1k/b1_1:/datasets/imagenet:ro \
+      -v ~/dinov3_pth:/dinov3_pth:ro \
+  -- \
+    --batch-size 4096 \
+  --data-dir /datasets/imagenet/val \
+  --linear-head-checkpoint /dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth \
+  --device cuda \
+  --distributed 
+
+
 bash  docker/run_imagenet_eval_ddp.sh  \
   --gpus all \
     --shm-size=120g \
