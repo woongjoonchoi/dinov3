@@ -18,6 +18,8 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 
 
+
+
 class ActivationDataset(Dataset[Tuple[torch.Tensor, int]]):
     """Dataset for activations saved under class-named folders."""
 
@@ -177,28 +179,65 @@ def _build_loader(
     return loader, dataset
 
 
+# def _init_wandb(args: argparse.Namespace, meta: _RunMetadata):
+#     if args.wandb_project is None:
+#         return None
+#     try:
+#         import wandb
+#     except ImportError:  # pragma: no cover - optional dependency
+#         print("wandb not installed; skipping logging.")
+#         return None
+
+#     wandb.init(project=args.wandb_project, name=args.wandb_run_name, config={
+#         "in_features": meta.in_features,
+#         "num_classes": meta.num_classes,
+#         "train_samples": meta.train_samples,
+#         "val_samples": meta.val_samples,
+#         "batch_size": args.batch_size,
+#         "epochs": args.epochs,
+#         "learning_rate": args.learning_rate,
+#         "weight_decay": args.weight_decay,
+#         "momentum": args.momentum,
+#     })
+#     return wandb
+
+
 def _init_wandb(args: argparse.Namespace, meta: _RunMetadata):
     if args.wandb_project is None:
         return None
+
     try:
         import wandb
-    except ImportError:  # pragma: no cover - optional dependency
+        from wandb.errors import CommError
+    except ImportError:
         print("wandb not installed; skipping logging.")
         return None
 
-    wandb.init(project=args.wandb_project, name=args.wandb_run_name, config={
-        "in_features": meta.in_features,
-        "num_classes": meta.num_classes,
-        "train_samples": meta.train_samples,
-        "val_samples": meta.val_samples,
-        "batch_size": args.batch_size,
-        "epochs": args.epochs,
-        "learning_rate": args.learning_rate,
-        "weight_decay": args.weight_decay,
-        "momentum": args.momentum,
-    })
-    return wandb
+    try:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "in_features": meta.in_features,
+                "num_classes": meta.num_classes,
+                "train_samples": meta.train_samples,
+                "val_samples": meta.val_samples,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "learning_rate": args.learning_rate,
+                "weight_decay": args.weight_decay,
+                "momentum": args.momentum,
+            },
+            settings=wandb.Settings(
+                insecure_disable_ssl=True,  #  SSL 인증서 검증 끔 (MITM 허용)
+            ),
+        )
+    except CommError as e:
+        print(f"[WARN] wandb init failed (network/SSL): {e}")
+        print("       → continuing WITHOUT wandb logging.")
+        return None
 
+    return wandb
 
 def _load_linear_head_state(path: pathlib.Path, device: torch.device) -> dict:
     """Load a linear head state dict, stripping common wrappers."""

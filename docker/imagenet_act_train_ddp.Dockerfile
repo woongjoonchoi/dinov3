@@ -14,6 +14,16 @@ RUN apt-get update && \
         git && \
     rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && \
+    apt-get install -y ca-certificates && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# ePrism 프록시 루트 CA 추가
+# !!! 여기서 더 이상 ~ 쓰면 안 되고, 빌드 컨텍스트(= project/docker) 기준 경로만 사용 !!!
+COPY eprism_root.crt /usr/local/share/ca-certificates/eprism_root.crt
+RUN chmod 644 /usr/local/share/ca-certificates/eprism_root.crt && \
+    update-ca-certificates
 # 3.11로 venv 생성
 RUN python3.11 -m venv /opt/py311
 

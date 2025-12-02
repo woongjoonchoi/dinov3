@@ -25,3 +25,6 @@ docker/*.sh
 #log
 
 *.log
+
+#crypt
+*.crt
