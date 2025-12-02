@@ -19,21 +19,16 @@ from tqdm import tqdm
 
 
 class ActivationDataset(Dataset[Tuple[torch.Tensor, int]]):
-    """Dataset for activation files arranged in class-named folders."""
+    """Dataset for activations saved under class-named folders."""
 
     def __init__(self, root: pathlib.Path) -> None:
         self.root = root
         class_dirs = [d for d in sorted(root.iterdir()) if d.is_dir()]
-        if not class_dirs:
-            raise RuntimeError(f"No class folders found under {root}.")
         self.classes: List[str] = [d.name for d in class_dirs]
-        self.class_to_idx = {name: idx for idx, name in enumerate(self.classes)}
 
-        self.samples: List[Tuple[pathlib.Path, int]] = []
+        self.samples: List[pathlib.Path] = []
         for class_dir in class_dirs:
-            class_idx = self.class_to_idx[class_dir.name]
-            for path in sorted(class_dir.glob("*.pt")):
-                self.samples.append((path, class_idx))
+            self.samples.extend(sorted(class_dir.glob("*.pt")))
         if not self.samples:
             raise RuntimeError(f"No activation files found under {root}.")
 
@@ -41,22 +36,16 @@ class ActivationDataset(Dataset[Tuple[torch.Tensor, int]]):
         return len(self.samples)
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
-        path, target = self.samples[index]
-        payload = torch.load(path, map_location="cpu")
-        if isinstance(payload, torch.Tensor):
-            activation = payload
-        elif isinstance(payload, dict):
-            activation = payload.get("activation") or payload.get("activations")
-            if activation is None:
-                raise KeyError(f"Missing activation tensor in {path}.")
-        else:
-            raise TypeError(f"Unsupported payload type in {path}: {type(payload)}")
-
+        path = self.samples[index]
+        data = torch.load(path)
+        if "activation" not in data:
+            raise KeyError(f"Missing 'activation' key in {path}.")
+        activation = data["activation"]
         if not isinstance(activation, torch.Tensor):
             activation = torch.tensor(activation)
-        if activation.ndim != 1:
-            activation = activation.view(-1)
-        return activation.float(), target
+        activation = activation.float()
+        target = int(data.get("class_idx"))
+        return activation, target
 
 
 def _parse_args() -> argparse.Namespace:
