@@ -96,19 +96,12 @@ class LocalGlobalBlock(nn.Module):
         linear_q_class = nn.Linear
         linear_kv_class = nn.Linear
 
-        self.global_q = linear_q_class(dim, dim, bias=qkv_bias, device=device)
-        self.global_kv = linear_kv_class(dim, dim * 2, bias=qkv_bias, device=device)
-        self.global_proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
+        # Share qkv/out projections between global and patch→global branches
+        self.shared_q = linear_q_class(dim, dim, bias=qkv_bias, device=device)
+        self.shared_kv = linear_kv_class(dim, dim * 2, bias=qkv_bias, device=device)
+        self.shared_proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
 
         self.enable_patch_to_global = enable_patch_to_global
-        if enable_patch_to_global:
-            self.patch_q = linear_q_class(dim, dim, bias=qkv_bias, device=device)
-            self.patch_kv = linear_kv_class(dim, dim * 2, bias=qkv_bias, device=device)
-            self.patch_proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
-        else:
-            self.patch_q = None
-            self.patch_kv = None
-            self.patch_proj = None
 
         self.proj_drop = nn.Dropout(drop)
 
@@ -128,13 +121,13 @@ class LocalGlobalBlock(nn.Module):
 
     def _global_attention(self, q_tokens: Tensor, kv_tokens: Tensor) -> Tensor:
         B, G, _ = q_tokens.shape
-        q = self.global_q(q_tokens).reshape(B, G, self.num_heads, -1).transpose(1, 2)
-        kv = self.global_kv(kv_tokens).reshape(B, kv_tokens.shape[1], 2, self.num_heads, -1)
+        q = self.shared_q(q_tokens).reshape(B, G, self.num_heads, -1).transpose(1, 2)
+        kv = self.shared_kv(kv_tokens).reshape(B, kv_tokens.shape[1], 2, self.num_heads, -1)
         k, v = torch.unbind(kv, dim=2)
         k, v = k.transpose(1, 2), v.transpose(1, 2)
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, G, -1)
-        out = self.global_proj(out)
+        out = self.shared_proj(out)
         out = self.proj_drop(out)
         return out
 
@@ -142,13 +135,13 @@ class LocalGlobalBlock(nn.Module):
         if not self.enable_patch_to_global:
             return torch.zeros_like(q_tokens)
         B, N, _ = q_tokens.shape
-        q = self.patch_q(q_tokens).reshape(B, N, self.num_heads, -1).transpose(1, 2)
-        kv = self.patch_kv(kv_tokens).reshape(B, kv_tokens.shape[1], 2, self.num_heads, -1)
+        q = self.shared_q(q_tokens).reshape(B, N, self.num_heads, -1).transpose(1, 2)
+        kv = self.shared_kv(kv_tokens).reshape(B, kv_tokens.shape[1], 2, self.num_heads, -1)
         k, v = torch.unbind(kv, dim=2)
         k, v = k.transpose(1, 2), v.transpose(1, 2)
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, N, -1)
-        out = self.patch_proj(out)
+        out = self.shared_proj(out)
         out = self.proj_drop(out)
         return out
 
@@ -167,11 +160,10 @@ class LocalGlobalBlock(nn.Module):
             global_tokens=global_tokens,
         )
 
-        kv_tokens = torch.cat((global_tokens, patch_local), dim=1)
+        kv_tokens = torch.cat((global_tokens, patch_tokens), dim=1)
         global_out = self._global_attention(global_tokens, kv_tokens)
 
-        patch_global = self._patch_global_attention(patch_local, global_out)
-        patch_out = patch_local + patch_global
+        patch_out = patch_local
 
         attn_out = torch.cat((global_out, patch_out), dim=1)
         x_attn = x + self.ls1(attn_out)
@@ -317,7 +309,6 @@ class LocalGlobalHybridVisionTransformer(nn.Module):
             self.local_cls_norm = None
         self.head = nn.Identity()
         self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
-        print(f"baseline 1_3 ")
 
     def _normalize_state_dict(self, state_dict: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """Strip common wrappers (DDP/module/backbone prefixes) from checkpoint keys."""
@@ -378,25 +369,15 @@ class LocalGlobalHybridVisionTransformer(nn.Module):
             remapped[f"{prefix}local_attn.v_global.weight"] = v_w.clone()
             remapped[f"{prefix}local_attn.v_global.bias"] = v_b.clone()
 
-            # Global branch weights
-            remapped[f"{prefix}global_q.weight"] = q_w.clone()
-            remapped[f"{prefix}global_q.bias"] = q_b.clone()
-            remapped[f"{prefix}global_kv.weight"] = torch.cat((k_w, v_w), dim=0)
-            remapped[f"{prefix}global_kv.bias"] = torch.cat((k_b, v_b), dim=0)
+            # Shared global / patch->global branch weights
+            remapped[f"{prefix}shared_q.weight"] = q_w.clone()
+            remapped[f"{prefix}shared_q.bias"] = q_b.clone()
+            remapped[f"{prefix}shared_kv.weight"] = torch.cat((k_w, v_w), dim=0)
+            remapped[f"{prefix}shared_kv.bias"] = torch.cat((k_b, v_b), dim=0)
             if proj_w is not None:
-                remapped[f"{prefix}global_proj.weight"] = proj_w
+                remapped[f"{prefix}shared_proj.weight"] = proj_w
             if proj_b is not None:
-                remapped[f"{prefix}global_proj.bias"] = proj_b
-
-            # Patch->global branch weights
-            remapped[f"{prefix}patch_q.weight"] = q_w.clone()
-            remapped[f"{prefix}patch_q.bias"] = q_b.clone()
-            remapped[f"{prefix}patch_kv.weight"] = torch.cat((k_w, v_w), dim=0)
-            remapped[f"{prefix}patch_kv.bias"] = torch.cat((k_b, v_b), dim=0)
-            if proj_w is not None:
-                remapped[f"{prefix}patch_proj.weight"] = proj_w
-            if proj_b is not None:
-                remapped[f"{prefix}patch_proj.bias"] = proj_b
+                remapped[f"{prefix}shared_proj.bias"] = proj_b
 
             # Local projection
             if proj_w is not None:
