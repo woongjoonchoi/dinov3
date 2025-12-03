@@ -8,7 +8,6 @@ from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbe
 from dinov3.utils import named_apply
 from dionv3_window.layers.window_block import WindowSelfAttentionBlock
 
-
 ffn_layer_dict = {
     "mlp": Mlp,
     "swiglu": SwiGLUFFN,
@@ -131,7 +130,7 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
             global_block_set = set(global_block_indices)
         else:
             global_block_set = None
-
+        print(f"global block interval : {global_block_interval}")
         blocks_list = []
         for i in range(depth):
             is_global = False
@@ -161,7 +160,8 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
             else:
                 shift_size = 0 if i % 2 == 0 else window_size // 2
                 blocks_list.append(
-                    WindowSelfAttentionBlock(
+                    _PatchOnlyWindowBlock(
+                        global_token_count=self.n_storage_tokens + 1,
                         dim=embed_dim,
                         num_heads=num_heads,
                         window_size=window_size,
@@ -341,6 +341,80 @@ class DinoVisionTransformerWindowBaseline1_1(nn.Module):
 
     def forward(self, x: torch.Tensor | List[torch.Tensor], masks: Optional[torch.Tensor] = None) -> List[Dict[str, torch.Tensor]]:
         return self.forward_features(x, masks)
+
+
+class _PatchOnlyWindowBlock(nn.Module):
+    """Window attention applied only to patch tokens.
+
+    CLS/storage tokens bypass the attention and FFN and are forwarded unchanged, so
+    they are effectively used only in global blocks.
+    """
+
+    def __init__(
+        self,
+        *,
+        global_token_count: int,
+        dim: int,
+        num_heads: int,
+        window_size: int,
+        shift_size: int,
+        ffn_ratio: float,
+        qkv_bias: bool,
+        proj_bias: bool,
+        ffn_bias: bool,
+        drop: float,
+        norm_layer,
+        act_layer,
+        ffn_layer,
+        init_values,
+        mask_k_bias,
+        device,
+    ) -> None:
+        super().__init__()
+        self.global_token_count = global_token_count
+        self.patch_block = WindowSelfAttentionBlock(
+            dim=dim,
+            num_heads=num_heads,
+            window_size=window_size,
+            shift_size=shift_size,
+            ffn_ratio=ffn_ratio,
+            qkv_bias=qkv_bias,
+            proj_bias=proj_bias,
+            ffn_bias=ffn_bias,
+            drop=drop,
+            norm_layer=norm_layer,
+            act_layer=act_layer,
+            ffn_layer=ffn_layer,
+            init_values=init_values,
+            mask_k_bias=mask_k_bias,
+            device=device,
+        )
+
+    def _forward_single(self, x: Tensor, rope, hw: Tuple[int, int]) -> Tensor:
+        g_tokens = x[:, : self.global_token_count]
+        p_tokens = x[:, self.global_token_count :]
+        p_tokens = self.patch_block(p_tokens, rope, hw)
+        return torch.cat([g_tokens, p_tokens], dim=1)
+
+    def forward(
+        self,
+        x_or_x_list,
+        rope_or_rope_list=None,
+        hw_or_hw_list: Optional[List[Tuple[int, int]] | Tuple[int, int]] = None,
+    ):
+        if isinstance(x_or_x_list, Tensor):
+            assert isinstance(hw_or_hw_list, tuple)
+            return self._forward_single(x_or_x_list, rope_or_rope_list, hw_or_hw_list)
+        elif isinstance(x_or_x_list, list):
+            if rope_or_rope_list is None:
+                rope_or_rope_list = [None for _ in x_or_x_list]
+            assert isinstance(hw_or_hw_list, list)
+            return [
+                self._forward_single(x, rope, hw)
+                for x, hw, rope in zip(x_or_x_list, hw_or_hw_list, rope_or_rope_list)
+            ]
+        else:
+            raise AssertionError
 
 
 __all__ = ["DinoVisionTransformerWindowBaseline1_1"]

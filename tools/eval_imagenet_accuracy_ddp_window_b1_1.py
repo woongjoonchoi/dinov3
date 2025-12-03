@@ -1,18 +1,24 @@
-"""Run ImageNet-style inference with a DinoV3 window backbone using DDP.
+"""Utility to evaluate ImageNet train/validation accuracy with the DINOv3 classifier.
 
-This script mirrors :mod:`tools.eval_imagenet_accuracy_ddp` but targets the
-``DinoVisionTransformerWindow`` backbone. It constructs the backbone and a
-linear classifier head from local checkpoints, wraps them with
-``DistributedDataParallel`` when requested, and reports per-split top-1
-accuracies.
+This script loads the ViT-7B/16 linear classifier head released with DINOv3 and
+computes the top-1 accuracy on the provided ImageNet splits.  The script only
+requires the directory structure that ``torchvision.datasets.ImageFolder``
+expects, i.e. ``<split>/<class_name>/<image>.JPEG``.
+
+Example::
+
+    python tools/eval_imagenet_accuracy.py \
+        --train-dir /datasets/imagenet/train \
+        --val-dir /datasets/imagenet/val \
+        --batch-size 128 --device cuda
 """
+
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import pathlib
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -20,12 +26,27 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import v2
+
+from dinov3.hub.classifiers import (
+    ClassifierWeights,
+    dinov3_vit7b16_lc,
+)
+# from dionv3_window_base2.hub.linear_classifier_gap import _GapLinearClassifierWrapper
+from dionv3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1
+from dinov3.hub.backbones import Weights as BackboneWeights
 from tqdm import tqdm
 
-# from dinov3.hub.classifiers import _LinearClassifierWrapper
-from dionv3_window_base2.hub.linear_classifier_gap import _GapLinearClassifierWrapper
-# from dionv3_window import DinoVisionTransformerWindow
-from dionv3_window_base2 import DinoVisionTransformerWindow
+def _resolve_weights(value: Optional[str], enum_type):
+    """Convert a CLI weight argument to the correct type for torch hub loaders."""
+
+    if value is None:
+        return value
+    normalized = value.strip().upper()
+    try:
+        return enum_type[normalized]
+    except KeyError:
+        # Treat as path or URL.
+        return value
 
 
 def make_transform(resize_size: int = 256, crop_size: Optional[int] = 224):
@@ -75,7 +96,7 @@ def _build_loader(
     rank: int,
     world_size: int,
 ) -> DataLoader:
-    dataset = datasets.ImageFolder(root=str(root), transform=make_transform())
+    dataset = datasets.ImageFolder(root=str(root), transform=make_transform(resize_size=512,crop_size=512))
     sampler = None
     if distributed:
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -98,79 +119,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size per device.")
     parser.add_argument("--num-workers", type=int, default=8, help="Number of dataloader workers.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on.")
-    parser.add_argument("--distributed", action="store_true", help="Use torch.distributed with torchrun for multi-GPU evaluation.")
-    parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
-    parser.add_argument("--backbone-checkpoint", type=pathlib.Path, required=True, help="Checkpoint containing the DinoVisionTransformerWindow weights.")
-    parser.add_argument("--head-checkpoint", type=pathlib.Path, required=True, help="Linear head checkpoint aligned with the backbone.")
-    parser.add_argument("--num-classes", type=int, default=1000, help="Number of output classes for the classifier head.")
-    parser.add_argument( "--model-kwargs",
-        type=json.loads,
-        default={},
-        # help="JSON object of keyword arguments forwarded to DinoVisionTransformerWindow (e.g. '{\\"embed_dim\\": 1024}')",
+    parser.add_argument(
+        "--classifier-weights",
+        type=str,
+        # default=ClassifierWeights.IMAGENET1K.name,
+        default = "/app/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth",
+        help="Classifier weights enum name, checkpoint path, or URL.",
     )
+    parser.add_argument(
+        "--backbone-weights",
+        type=str,
+        # default=BackboneWeights.LVD1689M.name,
+        default="/app/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth",
+        help="Backbone weights enum name, checkpoint path, or URL.",
+    )
+    parser.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Use torch.distributed with torchrun for multi-GPU evaluation.",
+    )
+    parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
     args = parser.parse_args()
     if args.train_dir is None and args.val_dir is None:
         parser.error("At least one of --train-dir or --val-dir must be specified.")
     return args
-
-
-def _load_state_dict(path: pathlib.Path) -> Dict[str, torch.Tensor]:
-    checkpoint = torch.load(path, map_location="cpu")
-    if isinstance(checkpoint, dict):
-        for key in ("model", "state_dict", "model_state_dict"):
-            if key in checkpoint:
-                checkpoint = checkpoint[key]
-                break
-    if not isinstance(checkpoint, dict):
-        raise RuntimeError(f"Unexpected checkpoint structure in {path}")
-    if any(k.startswith("module.") for k in checkpoint):
-        checkpoint = {k.removeprefix("module."): v for k, v in checkpoint.items()}
-    return checkpoint
-
-
-def _build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
-    backbone = DinoVisionTransformerWindow(**args.model_kwargs)
-    backbone_state = _load_state_dict(args.backbone_checkpoint)
-    backbone.load_state_dict(backbone_state, strict=True)
-
-    embed_dim = backbone.embed_dim
-
-    # linear_in_dim = 2 * embed_dim
-    linear_in_dim =  embed_dim
-    # linear_head = torch.nn.Linear(linear_in_dim, args.num_classes)
-    # head_state = _load_state_dict(args.head_checkpoint)
-    # linear_head.load_state_dict(head_state, strict=True)
-    # 기존: CLS+GAP concat(2C) 기준으로 학습된 head의 checkpoint 로드
-    head_state = _load_state_dict(args.head_checkpoint)
-
-    # checkpoint 안에 들어있는 weight / bias 꺼내기
-    old_weight = head_state["weight"]  # [num_classes, 2C]
-    old_bias   = head_state["bias"]    # [num_classes]
-
-    # 옛날 head의 in_dim = 2C
-    old_in_dim = old_weight.shape[1]
-    C = old_in_dim // 2
-
-    # 이제 backbone은 GAP만 쓰니까, 입력 차원 = C 여야 함
-    assert linear_in_dim == C, f"linear_in_dim={linear_in_dim}, but checkpoint has 2C={old_in_dim}"
-
-    # 새 head: GAP만 입력으로 받는 Linear(C -> num_classes)
-    linear_head = torch.nn.Linear(C, args.num_classes)
-
-    # W_gap 만 가져와서 초기화 (두 번째 절반)
-    W_gap = old_weight[:, C:]  # [num_classes, C]
-
-    with torch.no_grad():
-        linear_head.weight.copy_(W_gap)
-        linear_head.bias.copy_(old_bias)
-
-
-
-    # model = _LinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
-    model = _GapLinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
-    
-    model.to(device)
-    return model
 
 
 def main() -> None:
@@ -188,13 +160,45 @@ def main() -> None:
         device = torch.device(args.device)
         rank = 0
         world_size = 1
+    from dinov3.hub.backbones import dinov3_vit7b16
+    from dinov3.hub.classifiers import _LinearClassifierWrapper
 
-    model = _build_model(args, device)
+# 1) backbone 생성 (pretrained=False로 빈 모델만 만들기)
+    backbone = dinov3_vit7b16(
+        pretrained=False,    # 여기서 더 이상 URL 안 타게
+        weights=None,        # 중요: weights=None
+        check_hash=False,
+    )
+
+    # 2) backbone local weight 로드
+    # backbone_ckpt_path = "/app/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"
+    backbone_ckpt_path = "/dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"
+    backbone_state = torch.load(backbone_ckpt_path, map_location="cpu")
+    # 보통 이 ckpt는 "그대로 model.state_dict()" 형태라서:
+    backbone.load_state_dict(backbone_state, strict=True)
+
+    embed_dim = backbone.embed_dim  # 예: 4096 또는 8192
+
+    # 3) linear head 생성 (DINOv3가 쓰는 구조: [cls, mean(patch)] concat → Linear)
+    linear_in_dim = 2 * embed_dim          # wrapper에서 concat 하니까 2배
+    linear_head = torch.nn.Linear(linear_in_dim, 1000)  # ImageNet-1k
+
+    # # 4) linear head local weight 로드
+    # # head_ckpt_path = "/app/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth"
+    head_ckpt_path = "/dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth"
+    head_state = torch.load(head_ckpt_path, map_location="cpu")
+    linear_head.load_state_dict(head_state, strict=True)
+
+
+    # 5) DINOv3 전용 wrapper로 합치기
+    model = _LinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
+    # model = _GapLinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
+    model.to(device)
     if args.distributed:
         model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
     model.eval()
 
-    splits: list[tuple[str, pathlib.Path]] = []
+    splits = []
     if args.train_dir is not None:
         splits.append(("train", args.train_dir))
     if args.val_dir is not None:

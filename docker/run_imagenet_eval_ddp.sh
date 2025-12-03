@@ -27,7 +27,7 @@ bash  docker/run_imagenet_eval_ddp.sh  \
   -v /projects3/datasets/imagenet/imagenet-1k:/datasets/imagenet:ro \
       -v ~/dinov3_pth:/dinov3_pth:ro \
   -- \
-    --batch-size 1250 \
+    --batch-size 256 \
   --val-dir /datasets/imagenet/val \
   --device cuda \
   --distributed 

@@ -1,10 +1,11 @@
-"""Run ImageNet-style inference with a DinoV3 window backbone using DDP.
+"""Run ImageNet-style inference with the Baseline1_1 hybrid DinoV3 backbone using DDP.
 
 This script mirrors :mod:`tools.eval_imagenet_accuracy_ddp` but targets the
-``DinoVisionTransformerWindow`` backbone. It constructs the backbone and a
-linear classifier head from local checkpoints, wraps them with
-``DistributedDataParallel`` when requested, and reports per-split top-1
-accuracies.
+``DinoVisionTransformerWindowBaseline1_1`` backbone, which mixes periodic global
+self-attention blocks with windowed attention blocks that exclude CLS/storage
+from local attention. It constructs the backbone and a linear classifier head
+from local checkpoints, wraps them with ``DistributedDataParallel`` when
+requested, and reports per-split top-1 accuracies.
 """
 from __future__ import annotations
 
@@ -22,13 +23,12 @@ from torchvision import datasets
 from torchvision.transforms import v2
 from tqdm import tqdm
 
-# from dinov3.hub.classifiers import _LinearClassifierWrapper
-from dionv3_window_base2.hub.linear_classifier_gap import _GapLinearClassifierWrapper
-# from dionv3_window import DinoVisionTransformerWindow
-from dionv3_window_base2 import DinoVisionTransformerWindow
+from dinov3.hub.classifiers import _LinearClassifierWrapper
+from dinov3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1
+from dinov3_window_base1_1.vit import _PatchOnlyWindowBlock
 
 
-def make_transform(resize_size: int = 256, crop_size: Optional[int] = 224):
+def make_transform(resize_size: int = 224, crop_size: Optional[int] = 224):
     """Return the standard ImageNet transform recommended in the README."""
 
     to_image = v2.ToImage()
@@ -100,13 +100,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on.")
     parser.add_argument("--distributed", action="store_true", help="Use torch.distributed with torchrun for multi-GPU evaluation.")
     parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
-    parser.add_argument("--backbone-checkpoint", type=pathlib.Path, required=True, help="Checkpoint containing the DinoVisionTransformerWindow weights.")
+    parser.add_argument(
+        "--backbone-checkpoint",
+        type=pathlib.Path,
+        required=True,
+        help="Checkpoint containing the DinoVisionTransformerWindowBaseline1_1 weights.",
+    )
     parser.add_argument("--head-checkpoint", type=pathlib.Path, required=True, help="Linear head checkpoint aligned with the backbone.")
     parser.add_argument("--num-classes", type=int, default=1000, help="Number of output classes for the classifier head.")
-    parser.add_argument( "--model-kwargs",
+    parser.add_argument(
+        "--model-kwargs",
         type=json.loads,
         default={},
-        # help="JSON object of keyword arguments forwarded to DinoVisionTransformerWindow (e.g. '{\\"embed_dim\\": 1024}')",
+        help="JSON object of keyword arguments forwarded to DinoVisionTransformerWindowBaseline1_1 (e.g. '{\"embed_dim\": 1024}')",
     )
     args = parser.parse_args()
     if args.train_dir is None and args.val_dir is None:
@@ -128,47 +134,53 @@ def _load_state_dict(path: pathlib.Path) -> Dict[str, torch.Tensor]:
     return checkpoint
 
 
+def _remap_window_block_keys_to_patch_only(
+    model: DinoVisionTransformerWindowBaseline1_1, state_dict: Dict[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    """Adapt checkpoints from pre-patch-only window blocks.
+
+    Older checkpoints may store window block parameters directly under
+    ``blocks.{i}.norm1``/``attn``/``mlp``. The current Baseline1_1 wraps those
+    window blocks inside ``_PatchOnlyWindowBlock.patch_block``. This helper
+    moves keys into the nested module so they can load cleanly with ``strict``
+    semantics.
+    """
+
+    window_block_indices = [i for i, blk in enumerate(model.blocks) if isinstance(blk, _PatchOnlyWindowBlock)]
+    if not window_block_indices:
+        return state_dict
+
+    remapped: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for idx in window_block_indices:
+            prefix = f"blocks.{idx}."
+            nested_prefix = f"blocks.{idx}.patch_block."
+            if key.startswith(nested_prefix):
+                # Already in the expected location for patch-only blocks.
+                break
+            if key.startswith(prefix):
+                # Move legacy window block parameters under patch_block.
+                new_key = nested_prefix + key[len(prefix) :]
+                break
+        remapped[new_key] = value
+    return remapped
+
+
 def _build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
-    backbone = DinoVisionTransformerWindow(**args.model_kwargs)
-    backbone_state = _load_state_dict(args.backbone_checkpoint)
+    backbone = DinoVisionTransformerWindowBaseline1_1(**args.model_kwargs)
+    backbone_state = _remap_window_block_keys_to_patch_only(
+        backbone, _load_state_dict(args.backbone_checkpoint)
+    )
     backbone.load_state_dict(backbone_state, strict=True)
 
     embed_dim = backbone.embed_dim
-
-    # linear_in_dim = 2 * embed_dim
-    linear_in_dim =  embed_dim
-    # linear_head = torch.nn.Linear(linear_in_dim, args.num_classes)
-    # head_state = _load_state_dict(args.head_checkpoint)
-    # linear_head.load_state_dict(head_state, strict=True)
-    # 기존: CLS+GAP concat(2C) 기준으로 학습된 head의 checkpoint 로드
+    linear_in_dim = 2 * embed_dim
+    linear_head = torch.nn.Linear(linear_in_dim, args.num_classes)
     head_state = _load_state_dict(args.head_checkpoint)
+    linear_head.load_state_dict(head_state, strict=True)
 
-    # checkpoint 안에 들어있는 weight / bias 꺼내기
-    old_weight = head_state["weight"]  # [num_classes, 2C]
-    old_bias   = head_state["bias"]    # [num_classes]
-
-    # 옛날 head의 in_dim = 2C
-    old_in_dim = old_weight.shape[1]
-    C = old_in_dim // 2
-
-    # 이제 backbone은 GAP만 쓰니까, 입력 차원 = C 여야 함
-    assert linear_in_dim == C, f"linear_in_dim={linear_in_dim}, but checkpoint has 2C={old_in_dim}"
-
-    # 새 head: GAP만 입력으로 받는 Linear(C -> num_classes)
-    linear_head = torch.nn.Linear(C, args.num_classes)
-
-    # W_gap 만 가져와서 초기화 (두 번째 절반)
-    W_gap = old_weight[:, C:]  # [num_classes, C]
-
-    with torch.no_grad():
-        linear_head.weight.copy_(W_gap)
-        linear_head.bias.copy_(old_bias)
-
-
-
-    # model = _LinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
-    model = _GapLinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
-    
+    model = _LinearClassifierWrapper(backbone=backbone, linear_head=linear_head)
     model.to(device)
     return model
 

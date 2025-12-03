@@ -27,7 +27,7 @@ Examples:
     --coco-root /datasets/coco \
     --split val2017 \
     --batch-size 4 \
-    --max-size 1333 \
+    --max-size 1536 \
     --device cuda
 
 All arguments after the first "--" are forwarded to tools/eval_coco_detections.py.

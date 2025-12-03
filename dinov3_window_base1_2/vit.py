@@ -1,12 +1,15 @@
+import logging
 from functools import partial
-from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
 
-from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SwiGLUFFN
+from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
 from dinov3.utils import named_apply
-from dionv3_window_base2.layers.window_block import WindowSelfAttentionBlock
+from dionv3_window.layers.window_block import WindowSelfAttentionBlock
+
+logger = logging.getLogger("dinov3")
 
 ffn_layer_dict = {
     "mlp": Mlp,
@@ -48,7 +51,7 @@ def init_weights_vit(module: nn.Module, name: str = ""):
         module.reset_parameters()
 
 
-class DinoVisionTransformerWindow(nn.Module):
+class DinoVisionTransformerWindowLastGlobal(nn.Module):
     def __init__(
         self,
         *,
@@ -79,12 +82,13 @@ class DinoVisionTransformerWindow(nn.Module):
         untie_cls_and_patch_norms: bool = False,
         untie_global_and_local_cls_norm: bool = True,
         window_size: int = 7,
+        num_last_global_blocks: int = 4,
         device: Any | None = None,
         **ignored_kwargs,
     ):
         super().__init__()
         if len(ignored_kwargs) > 0:
-            print(f"Ignored kwargs: {ignored_kwargs}")
+            logger.warning(f"Ignored kwargs: {ignored_kwargs}")
         del ignored_kwargs
 
         norm_layer_cls = norm_layer_dict[norm_layer]
@@ -94,7 +98,10 @@ class DinoVisionTransformerWindow(nn.Module):
         self.num_heads = num_heads
         self.patch_size = patch_size
         self.window_size = window_size
-
+        self.num_last_global_blocks = max(0, min(num_last_global_blocks, depth))
+        # self.global_block_start = depth - self.num_last_global_blocks
+        self.global_block_start = self.num_last_global_blocks
+        print(f"global block_start :{self.global_block_start}")
         self.patch_embed = PatchEmbed(
             img_size=img_size,
             patch_size=patch_size,
@@ -103,7 +110,10 @@ class DinoVisionTransformerWindow(nn.Module):
             flatten_embedding=False,
         )
 
-        self.n_storage_tokens = 0
+        self.cls_token = nn.Parameter(torch.empty(1, 1, embed_dim, device=device))
+        self.n_storage_tokens = n_storage_tokens
+        if self.n_storage_tokens > 0:
+            self.storage_tokens = nn.Parameter(torch.empty(1, n_storage_tokens, embed_dim, device=device))
 
         self.rope_embed = RopePositionEmbedding(
             embed_dim=embed_dim,
@@ -118,67 +128,107 @@ class DinoVisionTransformerWindow(nn.Module):
             dtype=dtype_dict[pos_embed_rope_dtype],
             device=device,
         )
+
         ffn_layer_cls = ffn_layer_dict[ffn_layer]
         ffn_ratio_sequence = [ffn_ratio] * depth
-        blocks_list = []
+        blocks_list: List[nn.Module] = []
         for i in range(depth):
-            shift_size = 0 if i % 2 == 0 else window_size // 2
-            blocks_list.append(
-                WindowSelfAttentionBlock(
-                    dim=embed_dim,
-                    num_heads=num_heads,
-                    window_size=window_size,
-                    shift_size=shift_size,
-                    ffn_ratio=ffn_ratio_sequence[i],
-                    qkv_bias=qkv_bias,
-                    proj_bias=proj_bias,
-                    ffn_bias=ffn_bias,
-                    drop=drop_path_rate,
-                    norm_layer=norm_layer_cls,
-                    act_layer=nn.GELU,
-                    ffn_layer=ffn_layer_cls,
-                    init_values=layerscale_init,
-                    mask_k_bias=mask_k_bias,
-                    device=device,
+            if i < self.global_block_start:
+                shift_size = 0 if i % 2 == 0 else window_size // 2
+                blocks_list.append(
+                    WindowSelfAttentionBlock(
+                        dim=embed_dim,
+                        num_heads=num_heads,
+                        window_size=window_size,
+                        shift_size=shift_size,
+                        ffn_ratio=ffn_ratio_sequence[i],
+                        qkv_bias=qkv_bias,
+                        proj_bias=proj_bias,
+                        ffn_bias=ffn_bias,
+                        drop=drop_path_rate,
+                        norm_layer=norm_layer_cls,
+                        act_layer=nn.GELU,
+                        ffn_layer=ffn_layer_cls,
+                        init_values=layerscale_init,
+                        mask_k_bias=mask_k_bias,
+                        device=device,
+                    )
                 )
-            )
+            else:
+                blocks_list.append(
+                    SelfAttentionBlock(
+                        dim=embed_dim,
+                        num_heads=num_heads,
+                        ffn_ratio=ffn_ratio_sequence[i],
+                        qkv_bias=qkv_bias,
+                        proj_bias=proj_bias,
+                        ffn_bias=ffn_bias,
+                        drop=drop_path_rate,
+                        norm_layer=norm_layer_cls,
+                        act_layer=nn.GELU,
+                        ffn_layer=ffn_layer_cls,
+                        init_values=layerscale_init,
+                        mask_k_bias=mask_k_bias,
+                        drop_path=drop_path_rate,
+                        device=device,
+                    )
+                )
 
         self.blocks = nn.ModuleList(blocks_list)
 
         self.norm = norm_layer_cls(embed_dim)
 
         self.untie_cls_and_patch_norms = untie_cls_and_patch_norms
-        self.cls_norm = norm_layer_cls(embed_dim) if untie_cls_and_patch_norms else None
+        if untie_cls_and_patch_norms:
+            self.cls_norm = norm_layer_cls(embed_dim)
+        else:
+            self.cls_norm = None
 
         self.untie_global_and_local_cls_norm = untie_global_and_local_cls_norm
-        self.local_cls_norm = norm_layer_cls(embed_dim) if untie_global_and_local_cls_norm else None
+        if untie_global_and_local_cls_norm:
+            self.local_cls_norm = norm_layer_cls(embed_dim)
+        else:
+            self.local_cls_norm = None
         self.head = nn.Identity()
         self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
 
     def init_weights(self):
         self.rope_embed._init_weights()
+        nn.init.normal_(self.cls_token, std=0.02)
+        if self.n_storage_tokens > 0:
+            nn.init.normal_(self.storage_tokens, std=0.02)
         nn.init.zeros_(self.mask_token)
         named_apply(init_weights_vit, self)
-
-    def load_state_dict(self, state_dict: Mapping[str, Tensor], strict: bool = True):
-        state_dict = dict(state_dict)
-        ignored_keys = [
-            key
-            for key in state_dict.keys()
-            if key.endswith("cls_token") or key.endswith("storage_tokens") or key.endswith("register_tokens")
-        ]
-        for key in ignored_keys:
-            state_dict.pop(key, None)
-        if len(ignored_keys) > 0:
-            print(f"Ignored unexpected keys when loading state_dict: {ignored_keys}")
-        return super().load_state_dict(state_dict, strict=strict)
 
     def prepare_tokens_with_masks(self, x: Tensor, masks=None) -> Tuple[Tensor, Tuple[int, int]]:
         x = self.patch_embed(x)
         B, H, W, _ = x.shape
         x = x.flatten(1, 2)
+
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
+            cls_token = self.cls_token
+        else:
+            cls_token = self.cls_token + 0 * self.mask_token
+        if self.n_storage_tokens > 0:
+            storage_tokens = self.storage_tokens
+        else:
+            storage_tokens = torch.empty(
+                1,
+                0,
+                cls_token.shape[-1],
+                dtype=cls_token.dtype,
+                device=cls_token.device,
+            )
+
+        x = torch.cat(
+            [
+                cls_token.expand(B, -1, -1),
+                storage_tokens.expand(B, -1, -1),
+                x,
+            ],
+            dim=1,
+        )
 
         return x, (H, W)
 
@@ -189,23 +239,43 @@ class DinoVisionTransformerWindow(nn.Module):
             t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
             x.append(t2_x)
             hw_list.append(hw_tuple)
-        for _, blk in enumerate(self.blocks):
-            rope_sincos = [None for _ in x]
-            x = blk(x, rope_sincos, hw_list)
+        for idx, blk in enumerate(self.blocks):
+            if idx < self.global_block_start:
+                rope_sincos = [None for _ in hw_list]
+                updated_x = []
+                for tokens, _, hw in zip(x, rope_sincos, hw_list):
+                    global_tokens = tokens[:, : self.n_storage_tokens + 1]
+                    patch_tokens = tokens[:, self.n_storage_tokens + 1 :]
+                    patch_tokens = blk(patch_tokens, None, hw)
+                    updated_x.append(torch.cat([global_tokens, patch_tokens], dim=1))
+                x = updated_x
+            else:
+                if self.rope_embed is not None:
+                    rope_sincos = [self.rope_embed(H=H, W=W) for H, W in hw_list]
+                else:
+                    rope_sincos = [None for _ in hw_list]
+                x = blk(x, rope_sincos)
         all_x = x
         output = []
-        for idx, (x, masks) in enumerate(zip(all_x, masks_list)):
-            x_norm_patch = self.norm(x)
-            gap = x_norm_patch.mean(dim=1)
-            empty_storage = torch.empty(
-                x_norm_patch.shape[0], 0, x_norm_patch.shape[-1], device=x_norm_patch.device, dtype=x_norm_patch.dtype
-            )
+        for out_idx, (out_x, masks) in enumerate(zip(all_x, masks_list)):
+            if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:
+                if self.untie_global_and_local_cls_norm and self.training and out_idx == 1:
+                    out_norm_cls_reg = self.local_cls_norm(out_x[:, : self.n_storage_tokens + 1])
+                elif self.untie_cls_and_patch_norms:
+                    out_norm_cls_reg = self.cls_norm(out_x[:, : self.n_storage_tokens + 1])
+                else:
+                    out_norm_cls_reg = self.norm(out_x[:, : self.n_storage_tokens + 1])
+                out_norm_patch = self.norm(out_x[:, self.n_storage_tokens + 1 :])
+            else:
+                out_norm = self.norm(out_x)
+                out_norm_cls_reg = out_norm[:, : self.n_storage_tokens + 1]
+                out_norm_patch = out_norm[:, self.n_storage_tokens + 1 :]
             output.append(
                 {
-                    "x_norm_clstoken": gap,
-                    "x_storage_tokens": empty_storage,
-                    "x_norm_patchtokens": x_norm_patch,
-                    "x_prenorm": x,
+                    "x_norm_clstoken": out_norm_cls_reg[:, 0],
+                    "x_storage_tokens": out_norm_cls_reg[:, 1:],
+                    "x_norm_patchtokens": out_norm_patch,
+                    "x_prenorm": out_x,
                     "masks": masks,
                 }
             )
@@ -222,7 +292,15 @@ class DinoVisionTransformerWindow(nn.Module):
         output, total_block_len = [], len(self.blocks)
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         for i, blk in enumerate(self.blocks):
-            x = blk(x, None, (H, W))
+            if i < self.global_block_start:
+                rope_sincos = None
+                global_tokens = x[:, : self.n_storage_tokens + 1]
+                patch_tokens = x[:, self.n_storage_tokens + 1 :]
+                patch_tokens = blk(patch_tokens, rope_sincos, (H, W))
+                x = torch.cat([global_tokens, patch_tokens], dim=1)
+            else:
+                rope_sincos = self.rope_embed(H=H, W=W) if self.rope_embed is not None else None
+                x = blk(x, rope_sincos)
             if i in blocks_to_take:
                 output.append(x)
         assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
@@ -242,11 +320,16 @@ class DinoVisionTransformerWindow(nn.Module):
         if norm:
             outputs_normed = []
             for out in outputs:
-                outputs_normed.append(self.norm(out))
+                if self.untie_cls_and_patch_norms:
+                    x_norm_cls_reg = self.cls_norm(out[:, : self.n_storage_tokens + 1])
+                    x_norm_patch = self.norm(out[:, self.n_storage_tokens + 1 :])
+                    outputs_normed.append(torch.cat((x_norm_cls_reg, x_norm_patch), dim=1))
+                else:
+                    outputs_normed.append(self.norm(out))
             outputs = outputs_normed
-        class_tokens = [out.mean(dim=1) for out in outputs]
-        extra_tokens = [torch.empty(out.shape[0], 0, out.shape[-1], device=out.device, dtype=out.dtype) for out in outputs]
-        outputs = outputs
+        class_tokens = [out[:, 0] for out in outputs]
+        extra_tokens = [out[:, 1 : self.n_storage_tokens + 1] for out in outputs]
+        outputs = [out[:, self.n_storage_tokens + 1 :] for out in outputs]
         if reshape:
             B, _, h, w = x.shape
             outputs = [
@@ -266,4 +349,4 @@ class DinoVisionTransformerWindow(nn.Module):
         return self.forward_features(x, masks)
 
 
-__all__ = ["DinoVisionTransformerWindow"]
+__all__ = ["DinoVisionTransformerWindowLastGlobal"]
