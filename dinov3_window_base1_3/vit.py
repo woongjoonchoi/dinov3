@@ -689,6 +689,7 @@ class WindowSelfAttentionWithGlobal(nn.Module):
                     dtype=attn_mask_local.dtype,
                 )
                 attn_mask = torch.cat([attn_mask_local, zeros_for_global], dim=-1)
+                
             else:
                 attn_mask = attn_mask_local
             attn_mask = attn_mask.unsqueeze(1)
@@ -721,6 +722,7 @@ class WindowSelfAttentionWithGlobal(nn.Module):
 
         k = torch.cat([k_local] + [k_part.transpose(1, 2) for k_part in k_list[1:]], dim=2)
         v = torch.cat([v_local] + [v_part.transpose(1, 2) for v_part in v_list[1:]], dim=2)
+
 
         x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         x = x.transpose(1, 2)

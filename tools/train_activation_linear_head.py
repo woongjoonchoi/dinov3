@@ -147,6 +147,12 @@ def make_wandb_run_name(args: argparse.Namespace) -> str:
     if seed is not None:
         parts.append(f"s{seed}")
 
+    # 4) linear head 초기화 정보
+    # --load-linear-head 안 넘기면 (default=None) from-scratch 추가
+    load_linear_head = getattr(args, "load_linear_head", None)
+    if not load_linear_head:
+        parts.append("from-scratch")
+
     return "_".join(parts)
 
 
@@ -297,7 +303,7 @@ def _train_one_epoch(
             dist.all_reduce(step_loss, op=dist.ReduceOp.SUM)
             step_loss /= world_size
         if log_metrics is not None:
-            log_metrics({"train/loss": step_loss.item(), "epoch": epoch}, step=global_step + 1)
+            log_metrics({"loss/train": step_loss.item(), "epoch": epoch}, step=global_step + 1)
 
         global_step += 1
 
@@ -441,7 +447,7 @@ def main() -> None:
                 f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}"
             )
             if wandb is not None:
-                wandb.log({"val/loss": val_loss, "val/acc": val_acc, "epoch": epoch}, step=global_step)
+                wandb.log({"loss/val": val_loss, "val/acc": val_acc, "epoch": epoch}, step=global_step)
 
     if is_main_process:
         # args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
