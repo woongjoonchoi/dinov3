@@ -10,3 +10,5 @@ torchvision
 tqdm
 
 pycocotools>=2.0.7
+wandb
+weave

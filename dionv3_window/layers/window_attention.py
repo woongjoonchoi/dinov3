@@ -117,7 +117,6 @@ class WindowSelfAttention(nn.Module):
         qkv = self.qkv(qkv).reshape(B, N, 3, self.num_heads, C // self.num_heads)
         q, k, v = torch.unbind(qkv, 2)
         q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
-
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
 

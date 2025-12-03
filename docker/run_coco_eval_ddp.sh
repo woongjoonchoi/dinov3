@@ -21,41 +21,24 @@ bash  docker/run_imagenet_eval_ddp.sh  \
   --device cuda
 
 
-bash  docker/imagenet_act_eval_ddp.sh  \
+bash  docker/run_coco_eval_ddp.sh  \
   --gpus all \
     --shm-size=120g \
-   -v ~/imagenet_act/imagenet-1k:/datasets/imagenet:ro \
+  -v /projects3/datasets/coco/coco2017:/datasets/coco:ro \
       -v ~/dinov3_pth:/dinov3_pth:ro \
   -- \
-    --batch-size 4096 \
-  --data-dir /datasets/imagenet/val \
-  --linear-head-checkpoint /dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth \
+  --backbone-checkpoint  /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
+    --detector-checkpoint  /dinov3_pth/dinov3_vit7b16_coco_detr_head-b0235ff7.pth \
+    --batch-size 5 \
+  --coco-root /datasets/coco \
+  --ann-file /datasets/coco/annotations/instances_val2017.json \
+  --max-size 1536 \
   --device cuda \
-  --distributed 
-
-bash  docker/imagenet_act_eval_ddp.sh  \
-  --gpus all \
-    --shm-size=120g \
-   -v ~/imagenet_act/imagenet-1k/b1_1:/datasets/imagenet:ro \
-      -v ~/dinov3_pth:/dinov3_pth:ro \
-  -- \
-    --batch-size 4096 \
-  --data-dir /datasets/imagenet/val \
-  --linear-head-checkpoint /dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth \
-  --device cuda \
-  --distributed 
+  --distributed  
+  --pin-memory
 
 
-bash  docker/run_imagenet_eval_ddp.sh  \
-  --gpus all \
-    --shm-size=120g \
-  -v ~/imagenet/imagenet-1k:/datasets/imagenet:ro \
-      -v ~/dinov3_pth:/dinov3_pth:ro \
-  -- \
-    --batch-size 1024 \
-  --val-dir /datasets/imagenet/val \
-  --device cuda \
-  --distributed 
+
 
 
   docker/run_imagenet_eval_ddp.sh -- \
@@ -105,6 +88,6 @@ echo "docker_args: ${docker_args[@]}"
 echo "eval_args  : ${eval_args[@]}"
 
 
-docker build -f "${REPO_ROOT}/docker/imagenet_act_eval_ddp.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
+docker build -f "${REPO_ROOT}/docker/coco_eval_ddp.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
 
 docker run --rm "${docker_args[@]}" "${IMAGE_NAME}" "${eval_args[@]}"

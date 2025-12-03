@@ -21,29 +21,35 @@ bash  docker/run_imagenet_eval_ddp.sh  \
   --device cuda
 
 
-bash  docker/imagenet_act_eval_ddp.sh  \
+bash  docker/imagenet_act_save_ddp_b1.sh  \
   --gpus all \
     --shm-size=120g \
-   -v ~/imagenet_act/imagenet-1k:/datasets/imagenet:ro \
+  -v ~/imagenet/imagenet-1k:/datasets/imagenet:ro \
       -v ~/dinov3_pth:/dinov3_pth:ro \
+      -v ~/imagenet_act/imagenet-1k/b1_1/train:/output \
   -- \
-    --batch-size 4096 \
-  --data-dir /datasets/imagenet/val \
-  --linear-head-checkpoint /dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth \
+    --batch-size 1024 \
+    --backbone-checkpoint /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
+  --data-dir /datasets/imagenet/train \
+  --output-dir /output \
   --device cuda \
   --distributed 
 
-bash  docker/imagenet_act_eval_ddp.sh  \
+
+bash  docker/imagenet_act_save_ddp_b1.sh  \
   --gpus all \
     --shm-size=120g \
-   -v ~/imagenet_act/imagenet-1k/b1_1:/datasets/imagenet:ro \
+  -v ~/imagenet/imagenet-1k:/datasets/imagenet:ro \
       -v ~/dinov3_pth:/dinov3_pth:ro \
+      -v ~/imagenet_act/imagenet-1k/b1_1/val:/output \
   -- \
-    --batch-size 4096 \
+    --batch-size 1024 \
+    --backbone-checkpoint /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
   --data-dir /datasets/imagenet/val \
-  --linear-head-checkpoint /dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth \
+  --output-dir /output \
   --device cuda \
   --distributed 
+
 
 
 bash  docker/run_imagenet_eval_ddp.sh  \
@@ -105,6 +111,6 @@ echo "docker_args: ${docker_args[@]}"
 echo "eval_args  : ${eval_args[@]}"
 
 
-docker build -f "${REPO_ROOT}/docker/imagenet_act_eval_ddp.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
+docker build -f "${REPO_ROOT}/docker/imagenet_act_save_ddp_b1.Dockerfile" -t "${IMAGE_NAME}" "${REPO_ROOT}"
 
 docker run --rm "${docker_args[@]}" "${IMAGE_NAME}" "${eval_args[@]}"
