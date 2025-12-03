@@ -80,26 +80,21 @@ class LocalGlobalBlock(nn.Module):
         self.shift_size = shift_size
 
         self.norm1 = norm_layer(dim)
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias, device=device)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias, device=device)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias, device=device)
+        self.out_proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
+
         self.local_attn = WindowSelfAttentionWithGlobal(
             dim,
             num_heads=num_heads,
             window_size=window_size,
             shift_size=shift_size,
-            qkv_bias=qkv_bias,
-            proj_bias=proj_bias,
             attn_drop=attn_drop,
             proj_drop=drop,
             mask_k_bias=mask_k_bias,
             device=device,
         )
-
-        linear_q_class = nn.Linear
-        linear_kv_class = nn.Linear
-
-        # Share qkv/out projections between global and patch→global branches
-        self.shared_q = linear_q_class(dim, dim, bias=qkv_bias, device=device)
-        self.shared_kv = linear_kv_class(dim, dim * 2, bias=qkv_bias, device=device)
-        self.shared_proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
 
         self.enable_patch_to_global = enable_patch_to_global
 
@@ -121,13 +116,12 @@ class LocalGlobalBlock(nn.Module):
 
     def _global_attention(self, q_tokens: Tensor, kv_tokens: Tensor) -> Tensor:
         B, G, _ = q_tokens.shape
-        q = self.shared_q(q_tokens).reshape(B, G, self.num_heads, -1).transpose(1, 2)
-        kv = self.shared_kv(kv_tokens).reshape(B, kv_tokens.shape[1], 2, self.num_heads, -1)
-        k, v = torch.unbind(kv, dim=2)
-        k, v = k.transpose(1, 2), v.transpose(1, 2)
+        q = self.q_proj(q_tokens).reshape(B, G, self.num_heads, -1).transpose(1, 2)
+        k = self.k_proj(kv_tokens).reshape(B, kv_tokens.shape[1], self.num_heads, -1).transpose(1, 2)
+        v = self.v_proj(kv_tokens).reshape(B, kv_tokens.shape[1], self.num_heads, -1).transpose(1, 2)
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         out = out.transpose(1, 2).reshape(B, G, -1)
-        out = self.shared_proj(out)
+        out = self.out_proj(out)
         out = self.proj_drop(out)
         return out
 
@@ -158,6 +152,10 @@ class LocalGlobalBlock(nn.Module):
             hw=hw,
             rope=rope,
             global_tokens=global_tokens,
+            q_proj=self.q_proj,
+            k_proj=self.k_proj,
+            v_proj=self.v_proj,
+            out_proj=self.out_proj,
         )
 
         kv_tokens = torch.cat((global_tokens, patch_tokens), dim=1)
@@ -357,33 +355,17 @@ class LocalGlobalHybridVisionTransformer(nn.Module):
             if proj_b is None:
                 proj_b = torch.zeros_like(q_b)
 
-            # Local branch weights
-            remapped[f"{prefix}local_attn.q.weight"] = q_w.clone()
-            remapped[f"{prefix}local_attn.q.bias"] = q_b.clone()
-            remapped[f"{prefix}local_attn.k_local.weight"] = k_w.clone()
-            remapped[f"{prefix}local_attn.k_local.bias"] = k_b.clone()
-            remapped[f"{prefix}local_attn.v_local.weight"] = v_w.clone()
-            remapped[f"{prefix}local_attn.v_local.bias"] = v_b.clone()
-            remapped[f"{prefix}local_attn.k_global.weight"] = k_w.clone()
-            remapped[f"{prefix}local_attn.k_global.bias"] = k_b.clone()
-            remapped[f"{prefix}local_attn.v_global.weight"] = v_w.clone()
-            remapped[f"{prefix}local_attn.v_global.bias"] = v_b.clone()
-
-            # Shared global / patch->global branch weights
-            remapped[f"{prefix}shared_q.weight"] = q_w.clone()
-            remapped[f"{prefix}shared_q.bias"] = q_b.clone()
-            remapped[f"{prefix}shared_kv.weight"] = torch.cat((k_w, v_w), dim=0)
-            remapped[f"{prefix}shared_kv.bias"] = torch.cat((k_b, v_b), dim=0)
+            # Shared projections across branches
+            remapped[f"{prefix}q_proj.weight"] = q_w.clone()
+            remapped[f"{prefix}q_proj.bias"] = q_b.clone()
+            remapped[f"{prefix}k_proj.weight"] = k_w.clone()
+            remapped[f"{prefix}k_proj.bias"] = k_b.clone()
+            remapped[f"{prefix}v_proj.weight"] = v_w.clone()
+            remapped[f"{prefix}v_proj.bias"] = v_b.clone()
             if proj_w is not None:
-                remapped[f"{prefix}shared_proj.weight"] = proj_w
+                remapped[f"{prefix}out_proj.weight"] = proj_w
             if proj_b is not None:
-                remapped[f"{prefix}shared_proj.bias"] = proj_b
-
-            # Local projection
-            if proj_w is not None:
-                remapped[f"{prefix}local_attn.proj.weight"] = proj_w
-            if proj_b is not None:
-                remapped[f"{prefix}local_attn.proj.bias"] = proj_b
+                remapped[f"{prefix}out_proj.bias"] = proj_b
 
             # Remove old keys to avoid "unexpected" errors when strict=True
             remapped.pop(f"{prefix}attn.qkv.weight", None)
@@ -550,8 +532,6 @@ class WindowSelfAttentionWithGlobal(nn.Module):
         num_heads: int = 8,
         window_size: int = 7,
         shift_size: int = 0,
-        qkv_bias: bool = False,
-        proj_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         mask_k_bias: bool = False,
@@ -565,16 +545,7 @@ class WindowSelfAttentionWithGlobal(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim**-0.5
 
-        linear_q_class = nn.Linear
-        linear_kv_class = nn.Linear
-        self.q = linear_q_class(dim, dim, bias=qkv_bias, device=device)
-        self.k_local = linear_kv_class(dim, dim, bias=qkv_bias, device=device)
-        self.v_local = linear_kv_class(dim, dim, bias=qkv_bias, device=device)
-        self.k_global = linear_kv_class(dim, dim, bias=qkv_bias, device=device)
-        self.v_global = linear_kv_class(dim, dim, bias=qkv_bias, device=device)
-
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def get_attention_mask(self, H: int, W: int, device, dtype, batch_size: int) -> Tensor:
@@ -625,6 +596,11 @@ class WindowSelfAttentionWithGlobal(nn.Module):
         hw: Tuple[int, int],
         rope: Tensor | Tuple[Tensor, Tensor] | None = None,
         global_tokens: Tensor | None = None,
+        *,
+        q_proj: nn.Linear,
+        k_proj: nn.Linear,
+        v_proj: nn.Linear,
+        out_proj: nn.Linear,
     ) -> Tensor:
         B, N, C = patch_tokens.shape
         H, W = hw
@@ -675,13 +651,13 @@ class WindowSelfAttentionWithGlobal(nn.Module):
                 attn_mask = attn_mask_local
             attn_mask = attn_mask.unsqueeze(1)
 
-        q = self.q(patch_windows).reshape(
+        q = q_proj(patch_windows).reshape(
             B * num_windows, self.window_size * self.window_size, self.num_heads, C // self.num_heads
         )
-        k_local = self.k_local(patch_windows).reshape(
+        k_local = k_proj(patch_windows).reshape(
             B * num_windows, self.window_size * self.window_size, self.num_heads, C // self.num_heads
         )
-        v_local = self.v_local(patch_windows).reshape(
+        v_local = v_proj(patch_windows).reshape(
             B * num_windows, self.window_size * self.window_size, self.num_heads, C // self.num_heads
         )
 
@@ -689,8 +665,8 @@ class WindowSelfAttentionWithGlobal(nn.Module):
         v_list = [v_local]
         if global_tokens is not None:
             global_kv = global_tokens[:, None].expand(B, num_windows, -1, -1).reshape(B * num_windows, -1, C)
-            k_global = self.k_global(global_kv).reshape(B * num_windows, global_tokens.shape[1], self.num_heads, C // self.num_heads)
-            v_global = self.v_global(global_kv).reshape(B * num_windows, global_tokens.shape[1], self.num_heads, C // self.num_heads)
+            k_global = k_proj(global_kv).reshape(B * num_windows, global_tokens.shape[1], self.num_heads, C // self.num_heads)
+            v_global = v_proj(global_kv).reshape(B * num_windows, global_tokens.shape[1], self.num_heads, C // self.num_heads)
             k_list.append(k_global)
             v_list.append(v_global)
 
@@ -708,7 +684,7 @@ class WindowSelfAttentionWithGlobal(nn.Module):
         x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         x = x.transpose(1, 2)
         x = x.reshape(B * num_windows, self.window_size * self.window_size, C)
-        x = self.proj(x)
+        x = out_proj(x)
         x = self.proj_drop(x)
 
         merged = window_reverse(x, self.window_size, H, W, B)
