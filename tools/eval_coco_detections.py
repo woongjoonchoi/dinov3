@@ -8,7 +8,7 @@ import os
 import json
 import os
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -158,23 +158,24 @@ def build_dinov3_detector_custom(
     # -------------------------------
     # 2. backbone 생성 또는 주입
     # -------------------------------
+    n_windows_sqrt_map = {
+        "dinov3_vit7b16": 3,
+        "dinov3_vitl16plus": 2,
+    }
     if backbone is None:
         backbone_class_map = {
             "dinov3_vit7b16": dinov3_vit7b16,
             "dinov3_vitl16plus": dinov3_vitl16plus,
-            "b1_1" : DinoVisionTransformerWindowBaseline1_1 ,
-            "b1_3" : LocalGlobalHybridVisionTransformer,
-        }
-        n_windows_sqrt_map = {
-            "dinov3_vit7b16": 3,
-            "dinov3_vitl16plus": 2,
+            "dinov3_window_base1_1": DinoVisionTransformerWindowBaseline1_1,
+            "dinov3_window_base1_3": LocalGlobalHybridVisionTransformer,
+            "b1_1": DinoVisionTransformerWindowBaseline1_1,
+            "b1_3": LocalGlobalHybridVisionTransformer,
         }
 
         if backbone_name not in backbone_class_map:
             raise ValueError(f"Unsupported backbone_name: {backbone_name}")
 
         backbone_class = backbone_class_map[backbone_name]
-        n_windows_sqrt = n_windows_sqrt_map[backbone_name]
 
         # (A) 로컬 backbone ckpt를 사용하고 싶을 때
         if backbone_ckpt_path is not None:
@@ -193,6 +194,8 @@ def build_dinov3_detector_custom(
             # 로컬 ckpt에서 weight 로딩
             b_ckpt = torch.load(backbone_ckpt_path, map_location="cpu")
             b_state = b_ckpt["model"] if isinstance(b_ckpt, dict) and "model" in b_ckpt else b_ckpt
+            if isinstance(backbone, DinoVisionTransformerWindowBaseline1_1):
+                b_state = _remap_window_block_keys_to_patch_only(backbone, b_state)
             backbone.load_state_dict(b_state, strict=False)
 
         # (B) 공식 dinov3 BackboneWeights / URL 방식을 그대로 쓰고 싶을 때
@@ -206,6 +209,9 @@ def build_dinov3_detector_custom(
         # custom backbone이면 n_windows_sqrt는 속성에서 가져오고,
         # 없으면 기본값 3
         n_windows_sqrt = getattr(backbone, "n_windows_sqrt", 3)
+
+    if backbone is not None:
+        n_windows_sqrt = getattr(backbone, "n_windows_sqrt", n_windows_sqrt_map.get(backbone_name, 3))
 
     # 원래 코드도 backbone은 eval()로 고정
     backbone.eval()
@@ -422,24 +428,14 @@ def _load_checkpoint(path: Path) -> dict:
 
 
 def _build_model_from_checkpoints(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
-    model = detectors.dinov3_vit7b16_de(pretrained=False, weights="", backbone_weights="")
-    detector_module = model.detector
-    backbone_wrapper = detector_module.backbone[0]
-    if hasattr(backbone_wrapper, "backbone"):
-        backbone_module = backbone_wrapper.backbone
-    elif hasattr(backbone_wrapper, "_backbone"):
-        backbone_module = backbone_wrapper._backbone
-    else:
-        raise AttributeError(
-            "Backbone wrapper does not expose an inner backbone as 'backbone' or '_backbone'."
-        )
-
-    backbone_state = _load_checkpoint(args.backbone_checkpoint)
-    backbone_module.load_state_dict(backbone_state, strict=True)
-
-    detector_state = _load_checkpoint(args.detector_checkpoint)
-    detector_module.load_state_dict(detector_state, strict=False)
-
+    model = build_dinov3_detector_custom(
+        backbone_name=args.backbone_name,
+        backbone_pretrained=False,
+        backbone_weights=None,
+        backbone_ckpt_path=str(args.backbone_checkpoint),
+        detector_ckpt_path=str(args.detector_checkpoint),
+        num_classes=91,
+    )
     model.to(device)
     return model
 
