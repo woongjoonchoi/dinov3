@@ -32,7 +32,9 @@ from dinov3.eval.detection.config import DetectionHeadConfig
 from dinov3.eval.detection.models.position_encoding import PositionEncoding
 
 from dinov3.hub.backbones import Weights as BackboneWeights, dinov3_vit7b16, dinov3_vitl16plus
-
+from dinov3_window_base1_3 import LocalGlobalHybridVisionTransformer
+from dinov3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1
+from dinov3_window_base1_1.vit import _PatchOnlyWindowBlock
 # 네가 이미 위에 정의한 클래스라면 import 해서 쓰고,
 # 별도 파일이면 그대로 복붙해서 써도 됨.
 class DetectorWithProcessor(torch.nn.Module):
@@ -57,6 +59,39 @@ class DetectorWithProcessor(torch.nn.Module):
             target_sizes=sizes_tensor,
             original_target_sizes=sizes_tensor,
         )
+
+
+def _remap_window_block_keys_to_patch_only(
+    model: DinoVisionTransformerWindowBaseline1_1, state_dict: Dict[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    """Adapt checkpoints from pre-patch-only window blocks.
+
+    Older checkpoints may store window block parameters directly under
+    ``blocks.{i}.norm1``/``attn``/``mlp``. The current Baseline1_1 wraps those
+    window blocks inside ``_PatchOnlyWindowBlock.patch_block``. This helper
+    moves keys into the nested module so they can load cleanly with ``strict``
+    semantics.
+    """
+
+    window_block_indices = [i for i, blk in enumerate(model.blocks) if isinstance(blk, _PatchOnlyWindowBlock)]
+    if not window_block_indices:
+        return state_dict
+
+    remapped: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for idx in window_block_indices:
+            prefix = f"blocks.{idx}."
+            nested_prefix = f"blocks.{idx}.patch_block."
+            if key.startswith(nested_prefix):
+                # Already in the expected location for patch-only blocks.
+                break
+            if key.startswith(prefix):
+                # Move legacy window block parameters under patch_block.
+                new_key = nested_prefix + key[len(prefix) :]
+                break
+        remapped[new_key] = value
+    return remapped
 
 
 def build_dinov3_detector_custom(
@@ -127,6 +162,8 @@ def build_dinov3_detector_custom(
         backbone_class_map = {
             "dinov3_vit7b16": dinov3_vit7b16,
             "dinov3_vitl16plus": dinov3_vitl16plus,
+            "b1_1" : DinoVisionTransformerWindowBaseline1_1 ,
+            "b1_3" : LocalGlobalHybridVisionTransformer,
         }
         n_windows_sqrt_map = {
             "dinov3_vit7b16": 3,
@@ -353,6 +390,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
     parser.add_argument("--max-size", type=int, default=None, help="Optional maximum size for the shortest image side; keeps aspect ratio.")
     parser.add_argument("--score-threshold", type=float, default=0.0, help="Discard predictions below this confidence.")
+    parser.add_argument("--backbone-name" , type=str, default="dinov3_vit7b16",help="backbone-name")
     parser.add_argument(
         "--backbone-checkpoint",
         type=Path,
@@ -492,7 +530,8 @@ def main() -> None:
 
     
     model = build_dinov3_detector_custom(
-        backbone_name="dinov3_vit7b16",
+        # backbone_name="dinov3_vit7b16",
+        backbone_name=args.backbone_name,
         backbone_pretrained=False,
         backbone_weights=None,
         backbone_ckpt_path=args.backbone_checkpoint,
