@@ -26,6 +26,190 @@ from dinov3.hub import detectors
 from dinov3.eval.detection.models.detr import  PostProcess
 
 from torch import nn
+
+from dinov3.eval.detection.models.detr import PostProcess, build_model
+from dinov3.eval.detection.config import DetectionHeadConfig
+from dinov3.eval.detection.models.position_encoding import PositionEncoding
+
+from dinov3.hub.backbones import Weights as BackboneWeights, dinov3_vit7b16, dinov3_vitl16plus
+
+# 네가 이미 위에 정의한 클래스라면 import 해서 쓰고,
+# 별도 파일이면 그대로 복붙해서 써도 됨.
+class DetectorWithProcessor(torch.nn.Module):
+    """
+    takes as input a list of (3, H, W) normalized image tensors and outputs
+    a list of dicts with keys "scores", "labels" and "boxes" (format XYXY)
+    """
+
+    def __init__(self, detector, postprocessor):
+        super().__init__()
+        self.detector = detector
+        self.postprocessor = postprocessor
+
+    def forward(self, samples: list[torch.Tensor]):
+        outputs = self.detector(samples)
+        sizes_tensor = torch.tensor(
+            [sample.shape[1:] for sample in samples],
+            device=samples[0].device,
+        )  # N * [3, H, W]
+        return self.postprocessor(
+            outputs,
+            target_sizes=sizes_tensor,
+            original_target_sizes=sizes_tensor,
+        )
+
+
+def build_dinov3_detector_custom(
+    *,
+    # 1) 이미 만들어진 backbone 모듈을 직접 넘기고 싶을 때
+    backbone: Optional[nn.Module] = None,
+    # 2) 아니면 기존 dinov3 backbone 이름으로 생성
+    backbone_name: str = "dinov3_vit7b16",
+    backbone_pretrained: bool = True,
+    backbone_weights: BackboneWeights | str = BackboneWeights.LVD1689M,
+    # 3) 로컬 backbone ckpt 경로 (주어지면 이걸 우선 사용)
+    backbone_ckpt_path: Optional[str] = None,
+    # 4) detector head ckpt 로컬 경로 (옵션)
+    detector_ckpt_path: Optional[str] = None,
+    num_classes: int = 91,   # COCO 기준 91
+    check_hash: bool = False,
+    **kwargs,
+) -> nn.Module:
+    """
+    - dinov3의 _make_dinov3_detector를 기반으로,
+      - backbone은 로컬 ckpt 또는 공식 weights 둘 다 지원
+      - detector head는 로컬 ckpt에서 로딩
+    - .to(device), .eval()은 여기서 호출하지 않고, 호출하는 쪽에서 처리.
+    """
+
+    # -------------------------------
+    # 1. Detection head config 생성
+    # -------------------------------
+    detection_kwargs = dict(
+        with_box_refine=True,
+        two_stage=True,
+        mixed_selection=True,
+        look_forward_twice=True,
+        k_one2many=6,
+        lambda_one2many=1.0,
+        num_queries_one2one=1500,
+        num_queries_one2many=1500,
+        reparam=True,
+        position_embedding=PositionEncoding.SINE,
+        num_feature_levels=1,
+        dec_layers=6,
+        dim_feedforward=2048,
+        dropout=0.0,
+        norm_type="pre_norm",
+        proposal_feature_levels=4,
+        proposal_min_size=50,
+        decoder_type="global_rpe_decomp",
+        decoder_use_checkpoint=False,
+        decoder_rpe_hidden_dim=512,
+        decoder_rpe_type="linear",
+        layers_to_use=None,
+        blocks_to_train=None,
+        add_transformer_encoder=True,
+        num_encoder_layers=6,
+        backbone_use_layernorm=False,
+        num_classes=num_classes,
+        aux_loss=True,
+        topk=1500,
+        hidden_dim=768,
+        nheads=8,
+    )
+    config = DetectionHeadConfig(**detection_kwargs)
+
+    # -------------------------------
+    # 2. backbone 생성 또는 주입
+    # -------------------------------
+    if backbone is None:
+        backbone_class_map = {
+            "dinov3_vit7b16": dinov3_vit7b16,
+            "dinov3_vitl16plus": dinov3_vitl16plus,
+        }
+        n_windows_sqrt_map = {
+            "dinov3_vit7b16": 3,
+            "dinov3_vitl16plus": 2,
+        }
+
+        if backbone_name not in backbone_class_map:
+            raise ValueError(f"Unsupported backbone_name: {backbone_name}")
+
+        backbone_class = backbone_class_map[backbone_name]
+        n_windows_sqrt = n_windows_sqrt_map[backbone_name]
+
+        # (A) 로컬 backbone ckpt를 사용하고 싶을 때
+        if backbone_ckpt_path is not None:
+            if not os.path.isfile(backbone_ckpt_path):
+                raise FileNotFoundError(
+                    f"backbone_ckpt_path not found: {backbone_ckpt_path}"
+                )
+
+            # 구조만 만들고
+            backbone = backbone_class(
+                pretrained=False,
+                weights=None,
+                check_hash=check_hash,
+            )
+
+            # 로컬 ckpt에서 weight 로딩
+            b_ckpt = torch.load(backbone_ckpt_path, map_location="cpu")
+            b_state = b_ckpt["model"] if isinstance(b_ckpt, dict) and "model" in b_ckpt else b_ckpt
+            backbone.load_state_dict(b_state, strict=False)
+
+        # (B) 공식 dinov3 BackboneWeights / URL 방식을 그대로 쓰고 싶을 때
+        else:
+            backbone = backbone_class(
+                pretrained=backbone_pretrained,
+                weights=backbone_weights,
+                check_hash=check_hash,
+            )
+    else:
+        # custom backbone이면 n_windows_sqrt는 속성에서 가져오고,
+        # 없으면 기본값 3
+        n_windows_sqrt = getattr(backbone, "n_windows_sqrt", 3)
+
+    # 원래 코드도 backbone은 eval()로 고정
+    backbone.eval()
+
+    config.n_windows_sqrt = n_windows_sqrt
+    config.proposal_in_stride = backbone.patch_size
+    config.proposal_tgt_strides = [
+        int(m * backbone.patch_size) for m in (0.5, 1, 2, 4)
+    ]
+
+    if config.layers_to_use is None:
+        # e.g. [2, 5, 8, 11] for a backbone with 12 blocks
+        config.layers_to_use = [m * backbone.n_blocks // 4 - 1 for m in range(1, 5)]
+
+    # -------------------------------
+    # 3. detector head 생성
+    # -------------------------------
+    detector = build_model(backbone, config)
+
+    # -------------------------------
+    # 4. detector head 로컬 weight 로딩 (옵션)
+    # -------------------------------
+    if detector_ckpt_path is not None:
+        if not os.path.isfile(detector_ckpt_path):
+            raise FileNotFoundError(
+                f"detector_ckpt_path not found: {detector_ckpt_path}"
+            )
+        ckpt = torch.load(detector_ckpt_path, map_location="cpu")
+        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        detector.load_state_dict(state_dict, strict=False)
+
+    # inference용 설정 (원래 코드와 동일)
+    detector.num_queries = detector.num_queries_one2one
+    detector.transformer.two_stage_num_proposals = detector.num_queries
+
+    postprocessor = PostProcess(config.topk, config.reparam)
+    model = DetectorWithProcessor(detector=detector, postprocessor=postprocessor)
+
+    # 여기서는 .to(device), .eval() 호출 안 함
+    return model
+
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
@@ -295,16 +479,26 @@ def main() -> None:
     #     backbone_weights=str(args.backbone_checkpoint),  # <- 여기 경로 문자열
     # )
     
-    hub_model = torch.hub.load(
-        '/app', 
-        'dinov3_vit7b16_de',
-          source="local", 
-          weights=str(args.detector_checkpoint), 
-          backbone_weights=str(args.backbone_checkpoint))
-    detector = hub_model.detector  # 또는 hub_model 자체
-    postprocessor = PostProcess(topk=100, reparam=True)
+    # hub_model = torch.hub.load(
+    #     '/app', 
+    #     'dinov3_vit7b16_de',
+    #       source="local", 
+    #       weights=str(args.detector_checkpoint), 
+    #       backbone_weights=str(args.backbone_checkpoint))
+    # detector = hub_model.detector  # 또는 hub_model 자체
+    # postprocessor = PostProcess(topk=100, reparam=True)
 
-    model = DetectorWithProcessor(detector, postprocessor)
+    # model = DetectorWithProcessor(detector, postprocessor)
+
+    
+    model = build_dinov3_detector_custom(
+        backbone_name="dinov3_vit7b16",
+        backbone_pretrained=False,
+        backbone_weights=None,
+        backbone_ckpt_path=args.backbone_checkpoint,
+        detector_ckpt_path=args.detector_checkpoint,
+        num_classes=91,
+    )
     model.to(device)
     
     if args.distributed:
