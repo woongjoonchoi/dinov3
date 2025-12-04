@@ -29,7 +29,7 @@ bash  docker/run_imagenet_eval_ddp_window_b1_3.sh  \
   -- \
   --backbone-checkpoint  /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
     --head-checkpoint  /dinov3_pth/dinov3_vit7b16_imagenet1k_linear_head-90d8ed92.pth \
-    --batch-size 512 \
+    --batch-size 1024 \
   --val-dir /datasets/imagenet/val \
   --device cuda \
   --distributed 
