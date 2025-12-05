@@ -204,7 +204,7 @@ def _build_model(config: SegmentationConfig, device: torch.device, use_ddp: bool
             autocast_dtype=config.model_dtype.autocast_dtype,
             dropout=config.decoder_head.dropout,
         )
-        state_dict = torch.load(config.load_from, map_location="cpu")["model"]
+        state_dict = _load_segmentation_head_state_dict(config.load_from)
         segmentation_model.load_state_dict(state_dict, strict=False)
     segmentation_model = segmentation_model.to(device)
     if use_ddp:
@@ -289,6 +289,34 @@ def parse_args() -> argparse.Namespace:
         help="Enable pin_memory for the validation dataloader.",
     )
     return parser.parse_args()
+
+
+def _load_segmentation_head_state_dict(path: str) -> dict:
+    checkpoint = torch.load(path, map_location="cpu")
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"Unexpected checkpoint structure in {path}")
+
+    candidate_keys = ("model", "state_dict", "model_state_dict", "decoder")
+    state_dict = None
+    for key in candidate_keys:
+        maybe_state = checkpoint.get(key)
+        if isinstance(maybe_state, dict):
+            state_dict = maybe_state
+            break
+
+    if state_dict is None:
+        # If it already looks like a state dict, accept it.
+        if checkpoint and all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+            state_dict = checkpoint
+        else:
+            available_keys = ", ".join(sorted(checkpoint.keys()))
+            raise RuntimeError(
+                f"No state dict found in checkpoint {path}; available keys: {available_keys}"
+            )
+
+    if any(k.startswith("module.") for k in state_dict):
+        state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+    return state_dict
 
 
 def main() -> int:
