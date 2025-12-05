@@ -66,6 +66,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-run-name", type=str, default=None, help="Optional custom W&B run name.")
     parser.add_argument("--backend", type=str, default="nccl", help="Distributed backend for torch.distributed.init_process_group.")
     parser.add_argument("--local-rank", type=int, default=None, help="Local rank provided by torchrun for DDP training.")
+    parser.add_argument("--backbone", type=str, default=None, help="backbone version ")
+    parser.add_argument("--baseline", type=str, default=None, help="Baseline version ")
     return parser.parse_args()
 
 def resolve_checkpoint_path(args: argparse.Namespace) -> pathlib.Path:
