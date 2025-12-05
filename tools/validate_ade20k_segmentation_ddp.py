@@ -48,6 +48,34 @@ def _summarize_metrics(metric_values: torch.Tensor) -> dict[str, float]:
 
 
 @torch.inference_mode()
+def _split_batch_views(batch_img, batch_size: int) -> list[list[torch.Tensor]]:
+    """Convert dataloader batch output into per-sample view lists."""
+
+    if torch.is_tensor(batch_img):
+        if batch_img.dim() == 4:
+            return [[sample] for sample in batch_img]
+        if batch_img.dim() == 3:
+            return [[batch_img]]
+
+    if isinstance(batch_img, (list, tuple)):
+        if not batch_img:
+            return [[] for _ in range(batch_size)]
+
+        first_view = batch_img[0]
+        if torch.is_tensor(first_view):
+            # Default collate stacks the batch dimension for each view.
+            if first_view.dim() >= 4:
+                return [[view[sample_idx] for view in batch_img] for sample_idx in range(batch_size)]
+            # If views are not stacked, we assume a single-sample batch.
+            if batch_size == 1:
+                return [list(batch_img)]
+
+        if isinstance(first_view, (list, tuple)) and len(batch_img) == batch_size:
+            return [list(views) for views in batch_img]
+
+    raise TypeError(f"Unsupported batch format for validation: {type(batch_img)}")
+
+
 def _run_validation(
     model: torch.nn.Module | DDP,
     dataloader: Iterable,
@@ -67,33 +95,46 @@ def _run_validation(
     for iteration, (batch_img, (_, gt)) in enumerate(
         metric_logger.log_every(dataloader, 10, header="Validation: "), start=1
     ):
-        batch_img = [img.to(device).to(dtype=autocast_dtype) for img in batch_img]
-        gt = gt.to(device)[0]
-        aggregated_preds = torch.zeros(1, num_classes, gt.shape[-2], gt.shape[-1], device=device)
+        if torch.is_tensor(gt):
+            gt_batch = gt.to(device)
+            if gt_batch.dim() == 2:
+                gt_batch = gt_batch.unsqueeze(0)
+        elif isinstance(gt, (list, tuple)):
+            gt_batch = torch.stack([torch.as_tensor(target) for target in gt]).to(device)
+        else:
+            raise TypeError(f"Unsupported ground truth format: {type(gt)}")
+
+        per_sample_views = _split_batch_views(batch_img, batch_size=gt_batch.shape[0])
 
         inference_model = model.module if isinstance(model, DDP) else model
-        for img_idx, img in enumerate(batch_img):
-            aggregated_preds += make_inference(
-                img,
-                inference_model,
-                inference_mode="slide",
-                decoder_head_type=decoder_head_type,
-                rescale_to=gt.shape[-2:],
-                n_output_channels=num_classes,
-                crop_size=(eval_res, eval_res),
-                stride=(eval_stride, eval_stride),
-                apply_horizontal_flip=(img_idx and img_idx >= len(batch_img) / 2),
-                output_activation=lambda x: torch.nn.functional.softmax(x, dim=1),
+        for sample_views, gt_sample in zip(per_sample_views, gt_batch):
+            sample_views = [img.to(device).to(dtype=autocast_dtype) for img in sample_views]
+            aggregated_preds = torch.zeros(
+                1, num_classes, gt_sample.shape[-2], gt_sample.shape[-1], device=device
             )
 
-        aggregated_preds = (aggregated_preds / len(batch_img)).argmax(dim=1, keepdim=True)
-        intersect_and_union = calculate_intersect_and_union(
-            aggregated_preds[0],
-            gt,
-            num_classes=num_classes,
-            reduce_zero_label=True,
-        )
-        intersections.append(intersect_and_union)
+            for img_idx, img in enumerate(sample_views):
+                aggregated_preds += make_inference(
+                    img,
+                    inference_model,
+                    inference_mode="slide",
+                    decoder_head_type=decoder_head_type,
+                    rescale_to=gt_sample.shape[-2:],
+                    n_output_channels=num_classes,
+                    crop_size=(eval_res, eval_res),
+                    stride=(eval_stride, eval_stride),
+                    apply_horizontal_flip=(img_idx and img_idx >= len(sample_views) / 2),
+                    output_activation=lambda x: torch.nn.functional.softmax(x, dim=1),
+                )
+
+            aggregated_preds = (aggregated_preds / len(sample_views)).argmax(dim=1, keepdim=True)
+            intersect_and_union = calculate_intersect_and_union(
+                aggregated_preds[0],
+                gt_sample,
+                num_classes=num_classes,
+                reduce_zero_label=True,
+            )
+            intersections.append(intersect_and_union)
 
         if iteration % log_interval == 0:
             metrics = _summarize_metrics(torch.stack(intersections))
@@ -155,7 +196,7 @@ def _build_model(config: SegmentationConfig, device: torch.device, use_ddp: bool
     return segmentation_model
 
 
-def _build_dataloader(config: SegmentationConfig, pin_memory: bool):
+def _build_dataloader(config: SegmentationConfig, *, pin_memory: bool, batch_size: int):
     eval_res = config.eval.crop_size
     transforms = make_segmentation_eval_transforms(
         img_size=eval_res,
@@ -171,7 +212,7 @@ def _build_dataloader(config: SegmentationConfig, pin_memory: bool):
     sampler_type = SamplerType.DISTRIBUTED if distributed.is_enabled() else None
     return make_data_loader(
         dataset=dataset,
-        batch_size=1,
+        batch_size=batch_size,
         num_workers=config.num_workers,
         sampler_type=sampler_type,
         drop_last=False,
@@ -198,10 +239,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/ade20k_val"), help="Directory for logs.")
     parser.add_argument("--num-workers", type=int, default=6, help="Number of dataloader workers per process.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size for validation.")
     parser.add_argument("--eval-size", type=int, default=None, help="Resize validation images to this square resolution.")
     parser.add_argument("--log-interval", type=int, default=10, help="Iterations between intermediate metric logs.")
     parser.add_argument(
-        "--ddp",
+        "--distributed",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Wrap the model with DistributedDataParallel and enable distributed setup.",
@@ -219,12 +261,12 @@ def main() -> int:
     args = parse_args()
     config = _build_config(args)
 
-    with job_context(output_dir=str(args.output_dir), distributed_enabled=args.ddp):
+    with job_context(output_dir=str(args.output_dir), distributed_enabled=args.distributed):
         device = torch.device(
             f"cuda:{distributed.get_rank()}" if torch.cuda.is_available() else "cpu"
         )
-        segmentation_model = _build_model(config, device=device, use_ddp=args.ddp)
-        dataloader = _build_dataloader(config, pin_memory=args.pin_memory)
+        segmentation_model = _build_model(config, device=device, use_ddp=args.distributed)
+        dataloader = _build_dataloader(config, pin_memory=args.pin_memory, batch_size=args.batch_size)
         _ = _run_validation(
             segmentation_model,
             dataloader,
