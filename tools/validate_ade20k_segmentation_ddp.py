@@ -49,7 +49,7 @@ def _summarize_metrics(metric_values: torch.Tensor) -> dict[str, float]:
 
 @torch.inference_mode()
 def _run_validation(
-    model: DDP,
+    model: torch.nn.Module | DDP,
     dataloader: Iterable,
     *,
     num_classes: int,
@@ -60,7 +60,7 @@ def _run_validation(
     log_interval: int,
 ) -> dict[str, float]:
     model.eval()
-    device = torch.device(distributed.get_rank())
+    device = next(model.parameters()).device
     metric_logger = MetricLogger(delimiter="  ")
     intersections: list[torch.Tensor] = []
 
@@ -71,10 +71,11 @@ def _run_validation(
         gt = gt.to(device)[0]
         aggregated_preds = torch.zeros(1, num_classes, gt.shape[-2], gt.shape[-1], device=device)
 
+        inference_model = model.module if isinstance(model, DDP) else model
         for img_idx, img in enumerate(batch_img):
             aggregated_preds += make_inference(
                 img,
-                model.module,
+                inference_model,
                 inference_mode="slide",
                 decoder_head_type=decoder_head_type,
                 rescale_to=gt.shape[-2:],
@@ -110,19 +111,25 @@ def _run_validation(
 def _build_config(args: argparse.Namespace) -> SegmentationConfig:
     base_cfg = OmegaConf.load(args.config)
     structured_cfg = OmegaConf.structured(SegmentationConfig)
-    overrides = OmegaConf.create(
-        {
-            "datasets": {"root": str(args.dataset_root), "val": "ADE20K:split=VAL"},
-            "load_from": args.load_from,
-            "output_dir": str(args.output_dir),
-            "num_workers": args.num_workers,
-        }
-    )
+    overrides = {
+        "datasets": {"root": str(args.dataset_root), "val": "ADE20K:split=VAL"},
+        "load_from": args.load_from,
+        "output_dir": str(args.output_dir),
+        "num_workers": args.num_workers,
+    }
+    if args.eval_size is not None:
+        overrides.update(
+            {
+                "transforms": {"eval": {"img_size": args.eval_size}},
+                "eval": {"crop_size": args.eval_size},
+            }
+        )
+    overrides = OmegaConf.create(overrides)
     merged = OmegaConf.merge(structured_cfg, base_cfg, overrides)
     return OmegaConf.to_object(merged)
 
 
-def _build_model(config: SegmentationConfig, device: torch.device):
+def _build_model(config: SegmentationConfig, device: torch.device, use_ddp: bool):
     if config.load_from == "dinov3_vit7b16_ms":
         logger.info("Loading dinov3_vit7b16_ms segmentation head via torch hub.")
         segmentation_model = dinov3_vit7b16_ms(
@@ -143,10 +150,12 @@ def _build_model(config: SegmentationConfig, device: torch.device):
         state_dict = torch.load(config.load_from, map_location="cpu")["model"]
         segmentation_model.load_state_dict(state_dict, strict=False)
     segmentation_model = segmentation_model.to(device)
-    return DDP(segmentation_model, device_ids=[device])
+    if use_ddp:
+        return DDP(segmentation_model, device_ids=[device])
+    return segmentation_model
 
 
-def _build_dataloader(config: SegmentationConfig):
+def _build_dataloader(config: SegmentationConfig, pin_memory: bool):
     eval_res = config.eval.crop_size
     transforms = make_segmentation_eval_transforms(
         img_size=eval_res,
@@ -168,6 +177,7 @@ def _build_dataloader(config: SegmentationConfig):
         drop_last=False,
         shuffle=False,
         persistent_workers=True,
+        pin_memory=pin_memory,
     )
 
 
@@ -188,7 +198,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/ade20k_val"), help="Directory for logs.")
     parser.add_argument("--num-workers", type=int, default=6, help="Number of dataloader workers per process.")
+    parser.add_argument("--eval-size", type=int, default=None, help="Resize validation images to this square resolution.")
     parser.add_argument("--log-interval", type=int, default=10, help="Iterations between intermediate metric logs.")
+    parser.add_argument(
+        "--ddp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Wrap the model with DistributedDataParallel and enable distributed setup.",
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable pin_memory for the validation dataloader.",
+    )
     return parser.parse_args()
 
 
@@ -196,10 +219,12 @@ def main() -> int:
     args = parse_args()
     config = _build_config(args)
 
-    with job_context(output_dir=str(args.output_dir)):
-        device = torch.device(distributed.get_rank())
-        segmentation_model = _build_model(config, device=device)
-        dataloader = _build_dataloader(config)
+    with job_context(output_dir=str(args.output_dir), distributed_enabled=args.ddp):
+        device = torch.device(
+            f"cuda:{distributed.get_rank()}" if torch.cuda.is_available() else "cpu"
+        )
+        segmentation_model = _build_model(config, device=device, use_ddp=args.ddp)
+        dataloader = _build_dataloader(config, pin_memory=args.pin_memory)
         _ = _run_validation(
             segmentation_model,
             dataloader,
