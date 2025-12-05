@@ -161,7 +161,7 @@ def _build_config(args: argparse.Namespace) -> SegmentationConfig:
 
     if any((args.model_config, args.backbone_weights, args.backbone_hub)):
         overrides["model"] = {
-            "config_file": args.model_config,
+            "config_file": str(args.model_config) if args.model_config else None,
             "pretrained_weights": args.backbone_weights,
             "dino_hub": args.backbone_hub,
         }
@@ -188,6 +188,11 @@ def _build_model(config: SegmentationConfig, device: torch.device, use_ddp: bool
             raise ValueError(
                 "Backbone configuration is required when load_from points to a checkpoint. "
                 "Please provide --model-config/--backbone-weights or --backbone-hub."
+            )
+        if config.model.config_file is None and config.model.dino_hub is None:
+            raise ValueError(
+                "When loading a local segmentation checkpoint, please pass --model-config "
+                "to specify the backbone config file or --backbone-hub for a hub model."
             )
         backbone, _ = load_model_and_context(config.model, output_dir=config.output_dir)
         segmentation_model = build_segmentation_decoder(
