@@ -158,6 +158,13 @@ def _build_config(args: argparse.Namespace) -> SegmentationConfig:
         "output_dir": str(args.output_dir),
         "num_workers": args.num_workers,
     }
+
+    if any((args.model_config, args.backbone_weights, args.backbone_hub)):
+        overrides["model"] = {
+            "config_file": args.model_config,
+            "pretrained_weights": args.backbone_weights,
+            "dino_hub": args.backbone_hub,
+        }
     if args.eval_size is not None:
         overrides.update(
             {
@@ -177,7 +184,11 @@ def _build_model(config: SegmentationConfig, device: torch.device, use_ddp: bool
             autocast_dtype=config.model_dtype.autocast_dtype, check_hash=True
         )
     else:
-        assert config.model is not None, "Backbone configuration is required when load_from is a checkpoint path."
+        if config.model is None:
+            raise ValueError(
+                "Backbone configuration is required when load_from points to a checkpoint. "
+                "Please provide --model-config/--backbone-weights or --backbone-hub."
+            )
         backbone, _ = load_model_and_context(config.model, output_dir=config.output_dir)
         segmentation_model = build_segmentation_decoder(
             backbone,
@@ -236,6 +247,24 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="dinov3_vit7b16_ms",
         help="Checkpoint path or torch hub name for the segmentation decoder head.",
+    )
+    parser.add_argument(
+        "--model-config",
+        type=str,
+        default=None,
+        help="Backbone config file used when loading a local checkpoint.",
+    )
+    parser.add_argument(
+        "--backbone-weights",
+        type=str,
+        default=None,
+        help="Backbone checkpoint used when loading a local segmentation head.",
+    )
+    parser.add_argument(
+        "--backbone-hub",
+        type=str,
+        default=None,
+        help="Backbone identifier to load from torch.hub instead of a config file.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/ade20k_val"), help="Directory for logs.")
     parser.add_argument("--num-workers", type=int, default=6, help="Number of dataloader workers per process.")
