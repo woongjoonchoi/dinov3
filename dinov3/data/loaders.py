@@ -185,6 +185,7 @@ def make_data_loader(
     dataset,
     batch_size: int,
     num_workers: int,
+    pin_memory: bool = True,
     shuffle: bool = True,
     seed: int = 0,
     sampler_type: Optional[SamplerType] = SamplerType.INFINITE,
@@ -207,6 +208,7 @@ def make_data_loader(
         sampler_type: Which sampler to use: EPOCH, INFINITE, SHARDED_INFINITE, SHARDED_INFINITE_NEW, DISTRIBUTED or None.
         sampler_size: The number of images per epoch (when applicable) or -1 for the entire dataset.
         sampler_advance: How many samples to skip (when applicable).
+        pin_memory: Whether to pin memory in the DataLoader.
         drop_last: Whether the last non-full batch of data should be dropped.
         persistent_workers: maintain the workers Dataset instances alive after a dataset has been consumed once.
         collate_fn: Function that performs batch collation
@@ -228,7 +230,7 @@ def make_data_loader(
         sampler=sampler,
         batch_size=batch_size,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=drop_last,
         persistent_workers=persistent_workers,
         collate_fn=collate_fn,
