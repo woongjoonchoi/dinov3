@@ -25,24 +25,54 @@ class _Split(Enum):
         }[self]
 
 
-def _file_to_segmentation_path(file_name: str, segm_base_path: str) -> str:
-    file_name_noext = os.path.splitext(file_name)[0]
-    return os.path.join(segm_base_path, file_name_noext + ".png")
+def _image_to_segmentation_path(image_relpath: str) -> str:
+    """Map an image relative path to the matching annotation relative path."""
 
-
-def _load_segmentation(root: str, split_file_names: List[str]):
-    segm_base_path = "annotations"
-    segmentation_paths = [_file_to_segmentation_path(file_name, segm_base_path) for file_name in split_file_names]
-    return segmentation_paths
+    # Adequate for ADE20K folder naming convention: images/ADE/<split>/... -> annotations/ADE/<split>/...
+    base, _ = os.path.splitext(image_relpath)
+    return base.replace(os.path.join("images", "ADE"), os.path.join("annotations", "ADE"), 1) + ".png"
 
 
 def _load_file_paths(root: str, split: _Split) -> Tuple[List[str], List[str]]:
-    with open(os.path.join(root, f"ADE20K_object150_{split.value}.txt")) as f:
-        split_file_names = sorted(f.read().strip().split("\n"))
+    """Return image and annotation relative paths for a split.
 
-    all_segmentation_paths = _load_segmentation(root, split_file_names)
-    file_names = [os.path.join("images", el) for el in split_file_names]
-    return file_names, all_segmentation_paths
+    The loader prefers the official ADE text split files when present, but
+    gracefully falls back to walking the ADE folder structure (images/ADE/<split>
+    and annotations/ADE/<split>) if those files are not available.
+    """
+
+    list_file = os.path.join(root, f"ADE20K_object150_{split.value}.txt")
+
+    if os.path.exists(list_file):
+        with open(list_file) as f:
+            split_file_names = sorted(f.read().strip().split("\n"))
+
+        image_paths = [os.path.join("images", el) for el in split_file_names]
+        segmentation_paths = [_image_to_segmentation_path(p) for p in image_paths]
+        return image_paths, segmentation_paths
+
+    # Fallback: traverse the ADE folder layout.
+    image_root = os.path.join(root, "images", "ADE", split.dirname)
+    if not os.path.isdir(image_root):
+        raise FileNotFoundError(
+            f"ADE20K images for split '{split.value}' not found under {image_root}."
+        )
+
+    discovered_images: List[str] = []
+    for dirpath, _, filenames in os.walk(image_root):
+        for fname in filenames:
+            if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                rel_dir = os.path.relpath(dirpath, root)
+                discovered_images.append(os.path.join(rel_dir, fname))
+
+    if not discovered_images:
+        raise FileNotFoundError(
+            f"No ADE20K images discovered under {image_root}; ensure the dataset is mounted correctly."
+        )
+
+    discovered_images.sort()
+    segmentation_paths = [_image_to_segmentation_path(p) for p in discovered_images]
+    return discovered_images, segmentation_paths
 
 
 class ADE20K(ExtendedVisionDataset):
