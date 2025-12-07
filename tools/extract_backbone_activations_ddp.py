@@ -3,9 +3,8 @@
 This script mirrors the backbone construction logic from
 ``tools/eval_coco_detections.py`` so that each baseline backbone is loaded in
 the same way (including checkpoint remapping for window baselines). It runs the
-backbone with position encoding on an ``ImageFolder`` dataset and saves one
-``.pt`` file per image containing the per-level activations and positional
-encodings.
+backbone with position encoding on a COCO split and saves one ``.pt`` file per
+image containing the per-level activations and positional encodings.
 """
 
 from __future__ import annotations
@@ -20,8 +19,10 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torchvision import datasets
-from torchvision.transforms import v2
+from torchvision import transforms
+from torchvision.datasets import CocoDetection
+from torchvision.transforms import functional as F
+from torchvision.transforms.functional import InterpolationMode
 
 from dinov3.eval.detection.models.backbone import BackboneWithPositionEncoding, build_backbone
 from dinov3.eval.detection.models.position_encoding import PositionEncoding
@@ -131,32 +132,75 @@ def _build_backbone_model(args: argparse.Namespace) -> tuple[torch.nn.Module, in
     return backbone, n_windows_sqrt
 
 
-def _make_transform(resize_size: int = 256, crop_size: Optional[int] = 224):
-    to_image = v2.ToImage()
-    resize = v2.Resize((resize_size, resize_size), antialias=True)
-    center_crop: List[v2.Transform] = []
-    if crop_size is not None:
-        center_crop = [v2.CenterCrop(crop_size)]
-    to_float = v2.ToDtype(torch.float32, scale=True)
-    normalize = v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
-    return v2.Compose([to_image, resize, *center_crop, to_float, normalize])
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 
-class ImageFolderWithPaths(datasets.ImageFolder):
-    def __getitem__(self, index):  # type: ignore[override]
-        image, target = super().__getitem__(index)
-        path, _ = self.samples[index]
-        return image, target, path
+class ResizeShortSide:
+    def __init__(self, target_size: int):
+        self.target_size = target_size
+
+    def __call__(self, image):
+        width, height = image.size  # (W, H)
+        short = min(width, height)
+        if short == self.target_size:
+            return image
+        scale = self.target_size / short
+        new_w = int(round(width * scale))
+        new_h = int(round(height * scale))
+        return F.resize(image, (new_h, new_w), interpolation=InterpolationMode.BICUBIC)
 
 
-def _collate_with_paths(batch: Iterable[Tuple[torch.Tensor, int, str]]):
-    images, targets, paths = zip(*batch)
+def _make_transform(max_size: Optional[int]) -> transforms.Compose:
+    resize: List[object] = []
+    if max_size is not None:
+        resize = [ResizeShortSide(max_size)]
+    return transforms.Compose(
+        [
+            *resize,
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+        ]
+    )
+
+
+class CocoDetectionForActivations(CocoDetection):
+    def __init__(
+        self,
+        root: str,
+        ann_file: str,
+        *,
+        transform: transforms.Compose,
+    ) -> None:
+        super().__init__(root=root, annFile=ann_file)
+        self.image_transform = transform
+
+    def __getitem__(self, index):
+        image, _ = super().__getitem__(index)
+        image_id = self.ids[index]
+        info = self.coco.loadImgs(image_id)[0]
+        file_name = info.get("file_name", str(image_id))
+        orig_w, orig_h = image.size
+
+        image = self.image_transform(image)
+        return image, {
+            "image_id": int(image_id),
+            "orig_size": (orig_h, orig_w),
+            "file_name": file_name,
+        }
+
+
+def _collate_coco(batch: Iterable[Tuple[torch.Tensor, dict]]):
+    images, metas = zip(*batch)
     nested = nested_tensor_from_tensor_list(list(images))
-    return nested, torch.as_tensor(targets, dtype=torch.long), list(paths)
+    return nested, list(metas)
 
 
 def _build_loader(
-    root: pathlib.Path,
+    coco_root: pathlib.Path,
+    split: str,
+    ann_file: pathlib.Path,
+    max_size: Optional[int],
     batch_size: int,
     num_workers: int,
     pin_memory: bool,
@@ -164,7 +208,9 @@ def _build_loader(
     rank: int,
     world_size: int,
 ) -> DataLoader:
-    dataset = ImageFolderWithPaths(root=str(root), transform=_make_transform())
+    dataset = CocoDetectionForActivations(
+        root=str(coco_root / split), ann_file=str(ann_file), transform=_make_transform(max_size)
+    )
     sampler = None
     if distributed:
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -177,13 +223,21 @@ def _build_loader(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=_collate_with_paths,
+        collate_fn=_collate_coco,
     )
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=pathlib.Path, required=True, help="ImageFolder root directory.")
+    parser.add_argument("--coco-root", type=pathlib.Path, required=True, help="Path to COCO dataset root.")
+    parser.add_argument("--split", type=str, default="val2017", help="Dataset split to use (e.g., val2017).")
+    parser.add_argument(
+        "--ann-file",
+        type=pathlib.Path,
+        default=None,
+        help="Optional annotation file (defaults to annotations/instances_<split>.json).",
+    )
+    parser.add_argument("--max-size", type=int, default=None, help="Resize short side to this size before normalization.")
     parser.add_argument("--output-dir", type=pathlib.Path, required=True, help="Directory to write activation files.")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size per device.")
     parser.add_argument("--num-workers", type=int, default=8, help="Dataloader worker count.")
@@ -248,7 +302,7 @@ def _extract_and_save(
     output_root.mkdir(parents=True, exist_ok=True)
 
     global_index = start_index
-    for batch_idx, (samples, targets, paths) in enumerate(loader):
+    for batch_idx, (samples, metas) in enumerate(loader):
         nested: NestedTensor = samples
         nested = _move_nested_to_device(nested, device)
 
@@ -267,7 +321,9 @@ def _extract_and_save(
                 single_out_tensors = [t.half() for t in single_out_tensors]
                 single_pos = [p.half() for p in single_pos]
 
-            source_path = pathlib.Path(paths[in_batch_idx])
+            meta = metas[in_batch_idx]
+            image_id = meta.get("image_id")
+            file_name = meta.get("file_name")
             filename = f"{global_index:08d}.pt"
             output_path = output_root / filename
 
@@ -279,8 +335,9 @@ def _extract_and_save(
                     "global_index": global_index,
                     "batch_index": batch_idx,
                     "in_batch_index": in_batch_idx,
-                    "source_path": str(source_path),
-                    "class_index": int(targets[in_batch_idx]),
+                    "image_id": image_id,
+                    "file_name": file_name,
+                    "orig_size": meta.get("orig_size"),
                     "rank": rank,
                 },
             }
@@ -320,8 +377,20 @@ def main() -> None:
 
     backbone_with_pe.eval()
 
+    coco_root = args.coco_root
+    ann_file = args.ann_file or coco_root / "annotations" / f"instances_{args.split}.json"
+    image_root = coco_root / args.split
+
+    if not ann_file.exists():
+        raise FileNotFoundError(f"Annotation file not found: {ann_file}")
+    if not image_root.exists():
+        raise FileNotFoundError(f"Image directory not found: {image_root}")
+
     loader = _build_loader(
-        args.data_dir,
+        coco_root,
+        args.split,
+        ann_file,
+        args.max_size,
         args.batch_size,
         args.num_workers,
         args.pin_memory,
