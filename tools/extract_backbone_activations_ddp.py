@@ -112,7 +112,21 @@ def _build_backbone_model(args: argparse.Namespace) -> tuple[torch.nn.Module, in
     if args.backbone_checkpoint is not None:
         if not args.backbone_checkpoint.exists():
             raise FileNotFoundError(f"Backbone checkpoint not found: {args.backbone_checkpoint}")
-        backbone = backbone_class(pretrained=False, weights=None, check_hash=args.check_hash)
+        # backbone = backbone_class(pretrained=False, weights=None, check_hash=args.check_hash)
+
+        if args.backbone_name == "b1_1" or args.backbone_name == "b1_3":
+            backbone = backbone_class(
+                pretrained=False,
+                weights=None,
+                window_size = 16,
+                check_hash=args.check_hash,
+            )
+        else :
+            backbone = backbone_class(
+                pretrained=False,
+                weights=None,
+                check_hash=args.check_hash,
+            )
         state_dict = _load_checkpoint_state(args.backbone_checkpoint)
         if isinstance(backbone, DinoVisionTransformerWindowBaseline1_1):
             state_dict = _remap_window_block_keys_to_patch_only(backbone, state_dict)
@@ -122,6 +136,7 @@ def _build_backbone_model(args: argparse.Namespace) -> tuple[torch.nn.Module, in
         backbone = backbone_class(
             pretrained=args.backbone_pretrained,
             weights=weights,
+            window_size=16,
             check_hash=args.check_hash,
         )
 
@@ -151,10 +166,26 @@ class ResizeShortSide:
         return F.resize(image, (new_h, new_w), interpolation=InterpolationMode.BICUBIC)
 
 
+class ResizeAllSides:
+    def __init__(self, target_size: int):
+        self.target_size = target_size
+
+    def __call__(self, image):
+        width, height = image.size  # (W, H)
+        if width == self.target_size and height == self.target_size:
+            return image
+        # F.resize expects (H, W)
+        return F.resize(
+            image,
+            (self.target_size, self.target_size),
+            interpolation=InterpolationMode.BICUBIC,
+        )
+
 def _make_transform(max_size: Optional[int]) -> transforms.Compose:
     resize: List[object] = []
     if max_size is not None:
-        resize = [ResizeShortSide(max_size)]
+        # resize = [ResizeShortSide(max_size)]
+        resize = [ResizeAllSides(max_size)]
     return transforms.Compose(
         [
             *resize,
@@ -313,9 +344,9 @@ def _extract_and_save(
 
         batch_size = out[0].tensors.shape[0]
         for in_batch_idx in range(batch_size):
-            single_out_tensors = [lvl.tensors[in_batch_idx].detach().cpu() for lvl in out]
-            single_out_masks = [lvl.mask[in_batch_idx].detach().cpu() for lvl in out]
-            single_pos = [p[in_batch_idx].detach().cpu() for p in pos]
+            single_out_tensors = [lvl.tensors[in_batch_idx].detach().cpu().clone() for lvl in out]
+            single_out_masks = [lvl.mask[in_batch_idx].detach().cpu().clone() for lvl in out]
+            single_pos = [p[in_batch_idx].detach().cpu().clone() for p in pos]
 
             if save_fp16:
                 single_out_tensors = [t.half() for t in single_out_tensors]
@@ -325,7 +356,11 @@ def _extract_and_save(
             image_id = meta.get("image_id")
             file_name = meta.get("file_name")
             filename = f"{global_index:08d}.pt"
-            output_path = output_root / filename
+
+            rel_path = pathlib.Path(file_name).with_suffix(".pt")
+            # output_path = output_root / filename
+
+            output_path = output_root / rel_path
 
             activations = {
                 "out_tensors": single_out_tensors,
@@ -372,8 +407,8 @@ def main() -> None:
     backbone_with_pe = build_backbone(backbone_model, backbone_args)
     backbone_with_pe.to(device)
 
-    if args.distributed:
-        backbone_with_pe = DDP(backbone_with_pe, device_ids=[device] if device.type == "cuda" else None)
+    # if args.distributed:
+        # backbone_with_pe = DDP(backbone_with_pe, device_ids=[device] if device.type == "cuda" else None)
 
     backbone_with_pe.eval()
 

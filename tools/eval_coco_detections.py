@@ -185,11 +185,19 @@ def build_dinov3_detector_custom(
                 )
 
             # 구조만 만들고
-            backbone = backbone_class(
-                pretrained=False,
-                weights=None,
-                check_hash=check_hash,
-            )
+            if backbone_name == "b1_1" or backbone_name == "b1_3":
+                backbone = backbone_class(
+                    pretrained=False,
+                    weights=None,
+                    window_size = 16,
+                    check_hash=check_hash,
+                )
+            else :
+                backbone = backbone_class(
+                    pretrained=False,
+                    weights=None,
+                    check_hash=check_hash,
+                )
 
             # 로컬 ckpt에서 weight 로딩
             b_ckpt = torch.load(backbone_ckpt_path, map_location="cpu")
@@ -300,6 +308,21 @@ class ResizeShortSide:
         return F.resize(image, (new_h, new_w), interpolation=InterpolationMode.BICUBIC)
 
 
+class ResizeAllSides:
+    def __init__(self, target_size: int):
+        self.target_size = target_size
+
+    def __call__(self, image):
+        width, height = image.size  # (W, H)
+        if width == self.target_size and height == self.target_size:
+            return image
+        # F.resize expects (H, W)
+        return F.resize(
+            image,
+            (self.target_size, self.target_size),
+            interpolation=InterpolationMode.BICUBIC,
+        )
+
 class CocoDetectionForEval(CocoDetection):
     def __init__(
         self,
@@ -319,7 +342,8 @@ class CocoDetectionForEval(CocoDetection):
         orig_w, orig_h = image.size
 
         if self.max_size:
-            image = ResizeShortSide(self.max_size)(image)
+            # image = ResizeShortSide(self.max_size)(image)
+            image = ResizeAllSides(self.max_size)(image)
         resized_w, resized_h = image.size
 
         image = self.image_transform(image)
@@ -465,6 +489,17 @@ def main() -> None:
     )
     image_root = coco_root / args.split
 
+    # if rank == 0 :
+    #     ckpt = torch.load(args.detector_checkpoint, map_location="cpu")
+    #     print(ckpt['model'].keys())
+    #     state = ckpt.get("model", ckpt)  # some checkpoints store under "model"
+    #     print(len(state))
+    #     from collections import Counter
+
+    #     prefixes = Counter(k.split('.')[0] for k in state.keys())
+    #     print(prefixes)
+    
+    # exit()
     if not ann_file.exists():
         raise FileNotFoundError(f"Annotation file not found: {ann_file}")
     if not image_root.exists():

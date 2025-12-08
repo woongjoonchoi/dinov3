@@ -115,7 +115,7 @@ class PlainDETR(nn.Module):
 
         self.num_queries_one2one = num_queries_one2one
         self.mixed_selection = mixed_selection
-
+        
     def forward(self, samples: NestedTensor):
         """The forward expects a NestedTensor, which consists of:
            - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
@@ -134,6 +134,7 @@ class PlainDETR(nn.Module):
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
+        
 
         srcs = []
         masks = []

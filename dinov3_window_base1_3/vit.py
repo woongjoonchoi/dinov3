@@ -226,6 +226,7 @@ class LocalGlobalHybridVisionTransformer(nn.Module):
             print(f"Ignored kwargs: {ignored_kwargs}")
         del ignored_kwargs
 
+        print(f"b1_3 window size :{window_size}")
         norm_layer_cls = norm_layer_dict[norm_layer]
 
         self.num_features = self.embed_dim = embed_dim

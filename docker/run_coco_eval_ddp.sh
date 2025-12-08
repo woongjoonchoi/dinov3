@@ -29,12 +29,48 @@ bash  docker/run_coco_eval_ddp.sh  \
   -- \
   --backbone-checkpoint  /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
     --detector-checkpoint  /dinov3_pth/dinov3_vit7b16_coco_detr_head-b0235ff7.pth \
-    --batch-size 4 \
+    --batch-size 25 \
   --coco-root /datasets/coco \
   --ann-file /datasets/coco/annotations/instances_val2017.json \
   --max-size 1536 \
   --device cuda \
-  --distributed  
+  --distributed  \
+  --pin-memory
+
+
+bash  docker/run_coco_eval_ddp.sh  \
+  --gpus all \
+    --shm-size=120g \
+  -v /projects3/datasets/coco/coco2017:/datasets/coco:ro \
+      -v ~/dinov3_pth:/dinov3_pth:ro \
+  -- \
+  --backbone-checkpoint  /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
+    --detector-checkpoint  /dinov3_pth/dinov3_vit7b16_coco_detr_head-b0235ff7.pth \
+    --batch-size 25 \
+  --coco-root /datasets/coco \
+  --ann-file /datasets/coco/annotations/instances_val2017.json \
+  --max-size 1536 \
+  --device cuda \
+  --distributed  \
+  --backbone-name b1_3 \
+  --pin-memory
+
+
+bash  docker/run_coco_eval_ddp.sh  \
+  --gpus all \
+    --shm-size=120g \
+  -v /projects3/datasets/coco/coco2017:/datasets/coco:ro \
+      -v ~/dinov3_pth:/dinov3_pth:ro \
+  -- \
+  --backbone-checkpoint  /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
+    --detector-checkpoint  /dinov3_pth/dinov3_vit7b16_coco_detr_head-b0235ff7.pth \
+    --batch-size 25 \
+  --coco-root /datasets/coco \
+  --ann-file /datasets/coco/annotations/instances_val2017.json \
+  --max-size 1536 \
+  --device cuda \
+  --distributed  \
+  --backbone-name b1_1 \
   --pin-memory
 
 

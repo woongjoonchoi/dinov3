@@ -43,6 +43,7 @@ class WindowsWrapper(torch.nn.Module):
         tensors = tensor_list.tensors
         original_h, original_w = tensors.shape[2], tensors.shape[3]
         # Get height and width of the windows, such that it is a multiple of the patch size
+        
         window_h = math.ceil((original_h // self._n_windows_h) / self._patch_size) * self._patch_size
         window_w = math.ceil((original_w // self._n_windows_w) / self._patch_size) * self._patch_size
         all_h = [window_h] * (self._n_windows_h - 1) + [original_h - window_h * (self._n_windows_h - 1)]
@@ -59,6 +60,9 @@ class WindowsWrapper(torch.nn.Module):
                 window_mask = v2.functional.crop(
                     tensor_list.mask, top=all_h_cumsum[ih], left=all_w_cumsum[iw], height=all_h[ih], width=all_w[iw]
                 )
+                # print(f"tensor shape :{tensors.shape}")
+                # print(f"window tensor shape :{window_tensor.shape}")
+                # exit()
                 window_patch_features[ih][iw] = self._backbone(NestedTensor(tensors=window_tensor, mask=window_mask))[0]
 
         window_tensors = torch.cat(
@@ -73,7 +77,7 @@ class WindowsWrapper(torch.nn.Module):
         global_features = self._backbone(
             NestedTensor(tensors=resized_global_tensor, mask=tensor_list.mask)
         )  # mask is not used
-
+        
         concat_tensors = torch.cat(
             [v2.functional.resize(global_features[0].tensors, size=window_tensors.shape[-2:]), window_tensors], dim=1
         )
