@@ -13,7 +13,7 @@ import importlib
 import json
 import os
 import pathlib
-from typing import Any, Callable, Dict, List, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 from pathlib import Path
 from torch import nn
 import torch
@@ -33,7 +33,7 @@ from dinov3.eval.detection.util.misc import inverse_sigmoid
 
 from torchvision import transforms
 
-from dinov3.hub.backbones import dinov3_vit7b16, dinov3_vitl16plus
+from dinov3.hub.backbones import Weights as BackboneWeights, dinov3_vit7b16, dinov3_vitl16plus
 from dinov3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1
 from dinov3_window_base1_1.vit import _PatchOnlyWindowBlock
 from dinov3_window_base1_3 import LocalGlobalHybridVisionTransformer
@@ -74,20 +74,6 @@ def _remap_window_block_keys_to_patch_only(
     return remapped
 
 
-def _load_checkpoint_state(path: pathlib.Path) -> Dict[str, torch.Tensor]:
-    checkpoint = torch.load(path, map_location="cpu")
-    if isinstance(checkpoint, dict):
-        for key in ("model", "state_dict", "model_state_dict", "model_state"):
-            if key in checkpoint:
-                checkpoint = checkpoint[key]
-                break
-    if not isinstance(checkpoint, dict):
-        raise RuntimeError(f"Unexpected checkpoint structure in {path}")
-    if any(k.startswith("module.") for k in checkpoint):
-        checkpoint = {k.removeprefix("module."): v for k, v in checkpoint.items()}
-    return checkpoint
-
-
 def _build_backbone_model(args: argparse.Namespace) -> tuple[torch.nn.Module, int]:
     """Create the vision backbone following ``eval_coco_detections`` logic.
 
@@ -116,33 +102,34 @@ def _build_backbone_model(args: argparse.Namespace) -> tuple[torch.nn.Module, in
     if args.backbone_checkpoint is not None:
         if not args.backbone_checkpoint.exists():
             raise FileNotFoundError(f"Backbone checkpoint not found: {args.backbone_checkpoint}")
-        # backbone = backbone_class(pretrained=False, weights=None, check_hash=args.check_hash)
-
-        if args.backbone_name == "b1_1" or args.backbone_name == "b1_3":
+        if args.backbone_name in ("b1_1", "b1_3"):
             backbone = backbone_class(
                 pretrained=False,
                 weights=None,
-                window_size = 16,
+                window_size=16,
                 check_hash=args.check_hash,
             )
-        else :
+        else:
             backbone = backbone_class(
                 pretrained=False,
                 weights=None,
                 check_hash=args.check_hash,
             )
-        state_dict = _load_checkpoint_state(args.backbone_checkpoint)
-        if isinstance(backbone, DinoVisionTransformerWindowBaseline1_1):
-            state_dict = _remap_window_block_keys_to_patch_only(backbone, state_dict)
-        backbone.load_state_dict(state_dict, strict=False)
     else:
         weights = _resolve_weights(args.backbone_weights)
-        backbone = backbone_class(
-            pretrained=args.backbone_pretrained,
-            weights=weights,
-            window_size=16,
-            check_hash=args.check_hash,
-        )
+        if args.backbone_name in ("b1_1", "b1_3"):
+            backbone = backbone_class(
+                pretrained=args.backbone_pretrained,
+                weights=weights,
+                window_size=16,
+                check_hash=args.check_hash,
+            )
+        else:
+            backbone = backbone_class(
+                pretrained=args.backbone_pretrained,
+                weights=weights,
+                check_hash=args.check_hash,
+            )
 
     if n_windows_sqrt is None:
         n_windows_sqrt = getattr(backbone, "n_windows_sqrt", n_windows_sqrt_map.get(args.backbone_name, 3))
