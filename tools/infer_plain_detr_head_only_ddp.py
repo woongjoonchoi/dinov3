@@ -16,7 +16,6 @@ import pathlib
 from typing import Any, Callable, Dict, List, Union
 
 import torch
-import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
@@ -25,10 +24,9 @@ from tqdm import tqdm
 
 from dinov3.eval.detection.config import DetectionHeadConfig
 from dinov3.eval.detection.models.backbone import build_backbone
-from dinov3.eval.detection.models.detr import PlainDETR
+from dinov3.eval.detection.models.detr import PlainDETR, PlainDETRHeadOnly
 from dinov3.eval.detection.models.position_encoding import PositionEncoding
 from dinov3.eval.detection.models.transformer import build_transformer
-from dinov3.eval.detection.util.misc import inverse_sigmoid
 
 
 def _resolve_callable(spec: str) -> Callable[..., Any]:
