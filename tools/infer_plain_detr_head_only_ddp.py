@@ -14,9 +14,11 @@ import json
 import os
 import pathlib
 from typing import Any, Callable, Dict, List, Union
-
+from pathlib import Path
+from torch import nn
 import torch
 import torch.distributed as dist
+from torchvision.datasets import CocoDetection
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -27,7 +29,167 @@ from dinov3.eval.detection.models.backbone import build_backbone
 from dinov3.eval.detection.models.detr import PlainDETR, PlainDETRHeadOnly
 from dinov3.eval.detection.models.position_encoding import PositionEncoding
 from dinov3.eval.detection.models.transformer import build_transformer
+from dinov3.eval.detection.util.misc import inverse_sigmoid
 
+from torchvision import transforms
+
+from dinov3.hub.backbones import dinov3_vit7b16, dinov3_vitl16plus
+from dinov3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1
+from dinov3_window_base1_1.vit import _PatchOnlyWindowBlock
+from dinov3_window_base1_3 import LocalGlobalHybridVisionTransformer
+
+def _resolve_weights(value: Optional[str]) -> Optional[BackboneWeights | str]:
+    """Convert CLI weight string to hub enum when possible."""
+
+    if value is None:
+        return None
+    normalized = value.strip().upper()
+    try:
+        return BackboneWeights[normalized]
+    except KeyError:
+        return value
+
+
+def _remap_window_block_keys_to_patch_only(
+    model: DinoVisionTransformerWindowBaseline1_1, state_dict: Dict[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    """Adapt checkpoints from pre-patch-only window blocks (copied from eval script)."""
+
+    window_block_indices = [i for i, blk in enumerate(model.blocks) if isinstance(blk, _PatchOnlyWindowBlock)]
+    if not window_block_indices:
+        return state_dict
+
+    remapped: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for idx in window_block_indices:
+            prefix = f"blocks.{idx}."
+            nested_prefix = f"blocks.{idx}.patch_block."
+            if key.startswith(nested_prefix):
+                break
+            if key.startswith(prefix):
+                new_key = nested_prefix + key[len(prefix) :]
+                break
+        remapped[new_key] = value
+    return remapped
+
+
+def _load_checkpoint_state(path: pathlib.Path) -> Dict[str, torch.Tensor]:
+    checkpoint = torch.load(path, map_location="cpu")
+    if isinstance(checkpoint, dict):
+        for key in ("model", "state_dict", "model_state_dict", "model_state"):
+            if key in checkpoint:
+                checkpoint = checkpoint[key]
+                break
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"Unexpected checkpoint structure in {path}")
+    if any(k.startswith("module.") for k in checkpoint):
+        checkpoint = {k.removeprefix("module."): v for k, v in checkpoint.items()}
+    return checkpoint
+
+
+def _build_backbone_model(args: argparse.Namespace) -> tuple[torch.nn.Module, int]:
+    """Create the vision backbone following ``eval_coco_detections`` logic.
+
+    Returns the instantiated backbone and the inferred ``n_windows_sqrt`` value.
+    """
+
+    backbone_class_map = {
+        "dinov3_vit7b16": dinov3_vit7b16,
+        "dinov3_vitl16plus": dinov3_vitl16plus,
+        "dinov3_window_base1_1": DinoVisionTransformerWindowBaseline1_1,
+        "dinov3_window_base1_3": LocalGlobalHybridVisionTransformer,
+        "b1_1": DinoVisionTransformerWindowBaseline1_1,
+        "b1_3": LocalGlobalHybridVisionTransformer,
+    }
+    n_windows_sqrt_map = {
+        "dinov3_vit7b16": 3,
+        "dinov3_vitl16plus": 2,
+    }
+
+    if args.backbone_name not in backbone_class_map:
+        raise ValueError(f"Unsupported backbone_name: {args.backbone_name}")
+
+    backbone_class = backbone_class_map[args.backbone_name]
+    n_windows_sqrt = args.n_windows_sqrt
+
+    if args.backbone_checkpoint is not None:
+        if not args.backbone_checkpoint.exists():
+            raise FileNotFoundError(f"Backbone checkpoint not found: {args.backbone_checkpoint}")
+        # backbone = backbone_class(pretrained=False, weights=None, check_hash=args.check_hash)
+
+        if args.backbone_name == "b1_1" or args.backbone_name == "b1_3":
+            backbone = backbone_class(
+                pretrained=False,
+                weights=None,
+                window_size = 16,
+                check_hash=args.check_hash,
+            )
+        else :
+            backbone = backbone_class(
+                pretrained=False,
+                weights=None,
+                check_hash=args.check_hash,
+            )
+        state_dict = _load_checkpoint_state(args.backbone_checkpoint)
+        if isinstance(backbone, DinoVisionTransformerWindowBaseline1_1):
+            state_dict = _remap_window_block_keys_to_patch_only(backbone, state_dict)
+        backbone.load_state_dict(state_dict, strict=False)
+    else:
+        weights = _resolve_weights(args.backbone_weights)
+        backbone = backbone_class(
+            pretrained=args.backbone_pretrained,
+            weights=weights,
+            window_size=16,
+            check_hash=args.check_hash,
+        )
+
+    if n_windows_sqrt is None:
+        n_windows_sqrt = getattr(backbone, "n_windows_sqrt", n_windows_sqrt_map.get(args.backbone_name, 3))
+
+    backbone.eval()
+    return backbone, n_windows_sqrt
+
+
+class CocoDetectionForEval(CocoDetection):
+    def __init__(
+        self,
+        root: str,
+        ann_file: str,
+        *,
+        transform: transforms.Compose,
+        max_size: int | None = None,
+    ) -> None:
+        super().__init__(root=root, annFile=ann_file)
+        self.image_transform = transform
+        self.max_size = max_size
+
+    def __getitem__(self, index):
+        image, _ = super().__getitem__(index)
+        image_id = self.ids[index]
+        orig_w, orig_h = image.size
+
+        if self.max_size:
+            # image = ResizeShortSide(self.max_size)(image)
+            image = ResizeAllSides(self.max_size)(image)
+        resized_w, resized_h = image.size
+
+        image = self.image_transform(image)
+        return image, {
+            "image_id": int(image_id),
+            "orig_size": (orig_h, orig_w),
+            "resized_size": (resized_h, resized_w),
+        }
+
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
+def build_transform() -> transforms.Compose:
+    return transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+        ]
+    )
 
 def _resolve_callable(spec: str) -> Callable[..., Any]:
     module_name, function_name = spec.split(":", maxsplit=1)
@@ -46,20 +208,27 @@ def _parse_list_of_ints(value: str | None) -> list[int] | None:
 def _parse_args() -> argparse.Namespace:
     defaults = DetectionHeadConfig()
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--coco-root", required=True, help="Path to COCO dataset root (containing annotations/ and split folders).")
+    parser.add_argument("--split", default="val2017", help="Image split to evaluate (e.g., val2017).")
+    parser.add_argument(
+        "--ann-file",
+        default=None,
+        help="Optional path to annotations file; defaults to annotations/instances_<split>.json under --coco-root.",
+    )
     parser.add_argument("--activation-root", type=pathlib.Path, required=True, help="Directory containing .pt activation files.")
     parser.add_argument("--checkpoint", type=pathlib.Path, required=True, help="Detection checkpoint with transformer/head weights.")
-    parser.add_argument(
-        "--dataset-builder",
-        type=str,
-        required=True,
-        help="Callable spec 'module:function' that returns the base detection dataset.",
-    )
-    parser.add_argument(
-        "--dataset-builder-kwargs",
-        type=json.loads,
-        default={},
-        help="JSON string of kwargs forwarded to the dataset builder.",
-    )
+    # parser.add_argument(
+    #     "--dataset-builder",
+    #     type=str,
+    #     required=True,
+    #     help="Callable spec 'module:function' that returns the base detection dataset.",
+    # )
+    # parser.add_argument(
+    #     "--dataset-builder-kwargs",
+    #     type=json.loads,
+    #     default={},
+    #     help="JSON string of kwargs forwarded to the dataset builder.",
+    # )
     parser.add_argument(
         "--backbone-builder",
         type=str,
@@ -119,6 +288,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no-with-box-refine", action="store_false", dest="with_box_refine", help="Disable box refinement.")
     parser.add_argument("--one-stage", action="store_false", dest="two_stage", help="Disable two-stage transformer proposals.")
     parser.add_argument("--no-mixed-selection", action="store_false", dest="mixed_selection", help="Disable mixed selection.")
+    
     parser.set_defaults(
         aux_loss=defaults.aux_loss,
         with_box_refine=defaults.with_box_refine,
@@ -484,7 +654,29 @@ def main() -> None:
 
     dataset_builder = _resolve_callable(args.dataset_builder)
     base_dataset = dataset_builder(**args.dataset_builder_kwargs)
+    
+    coco_root = Path(args.coco_root)
+    ann_file = (
+        Path(args.ann_file)
+        if args.ann_file is not None
+        else coco_root / "annotations" / f"instances_{args.split}.json"
+    )
+    image_root = coco_root / args.split
 
+    if not ann_file.exists():
+        raise FileNotFoundError(f"Annotation file not found: {ann_file}")
+    if not image_root.exists():
+        raise FileNotFoundError(f"Image directory not found: {image_root}")
+
+    if not args.backbone_checkpoint.exists():
+        raise FileNotFoundError(f"Backbone checkpoint not found: {args.backbone_checkpoint}")
+    if not args.detector_checkpoint.exists():
+        raise FileNotFoundError(f"Detector checkpoint not found: {args.detector_checkpoint}")
+
+    base_dataset = CocoDetectionForEval(
+        root=str(image_root), ann_file=str(ann_file), transform=build_transform()
+    )
+    
     model = build_head_only_model(config, backbone_model, args.checkpoint, device)
     if args.distributed:
         model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
