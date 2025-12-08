@@ -20,6 +20,7 @@
 Deformable DETR model and criterion classes.
 """
 import math
+from typing import List
 
 import torch
 import torch.nn.functional as F
@@ -233,6 +234,122 @@ class PlainDETR(nn.Module):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
+        return [{"pred_logits": a, "pred_boxes": b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+
+
+class PlainDETRHeadOnly(nn.Module):
+    """Head-only wrapper that reuses a :class:`PlainDETR` without its backbone."""
+
+    def __init__(self, base: PlainDETR):
+        super().__init__()
+        self.transformer = base.transformer
+        self.input_proj = base.input_proj
+        self.query_embed = getattr(base, "query_embed", None)
+        self.class_embed = base.class_embed
+        self.bbox_embed = base.bbox_embed
+        self.num_queries = base.num_queries
+        self.num_feature_levels = base.num_feature_levels
+        self.aux_loss = base.aux_loss
+        self.with_box_refine = base.with_box_refine
+        self.two_stage = base.two_stage
+        self.num_queries_one2one = base.num_queries_one2one
+        self.mixed_selection = base.mixed_selection
+
+    def forward(self, srcs: List[torch.Tensor], masks: List[torch.Tensor], pos: List[torch.Tensor]):
+        """
+        Args:
+            srcs:  List of per-level feature maps with shape ``[B, C_l, H_l, W_l]``.
+            masks: List of attention masks with shape ``[B, H_l, W_l]``.
+            pos:   List of positional encodings with shape ``[B, D_pos, H_l, W_l]``.
+        """
+
+        proj_srcs: List[torch.Tensor] = []
+        for layer, src in enumerate(srcs):
+            proj_srcs.append(self.input_proj[layer](src))
+
+        query_embeds = None
+        if (self.query_embed is not None) and (not self.two_stage or self.mixed_selection):
+            query_embeds = self.query_embed.weight[0 : self.num_queries, :]
+
+        self_attn_mask = torch.zeros(
+            [
+                self.num_queries,
+                self.num_queries,
+            ],
+            dtype=bool,
+            device=proj_srcs[0].device,
+        )
+        self_attn_mask[
+            self.num_queries_one2one :,
+            0 : self.num_queries_one2one,
+        ] = True
+        self_attn_mask[
+            0 : self.num_queries_one2one,
+            self.num_queries_one2one :,
+        ] = True
+
+        (
+            hs,
+            init_reference,
+            inter_references,
+            enc_outputs_class,
+            enc_outputs_coord_unact,
+            enc_outputs_delta,
+            output_proposals,
+            max_shape,
+        ) = self.transformer(proj_srcs, masks, pos, query_embeds, self_attn_mask)
+
+        outputs_classes_one2one = []
+        outputs_coords_one2one = []
+        outputs_classes_one2many = []
+        outputs_coords_one2many = []
+        for lvl in range(hs.shape[0]):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            outputs_class = self.class_embed[lvl](hs[lvl])
+            tmp = self.bbox_embed[lvl](hs[lvl])
+            if reference.shape[-1] == 4:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            outputs_coord = tmp.sigmoid()
+
+            outputs_classes_one2one.append(outputs_class[:, 0 : self.num_queries_one2one])
+            outputs_classes_one2many.append(outputs_class[:, self.num_queries_one2one :])
+
+            outputs_coords_one2one.append(outputs_coord[:, 0 : self.num_queries_one2one])
+            outputs_coords_one2many.append(outputs_coord[:, self.num_queries_one2one :])
+
+        outputs_classes_one2one = torch.stack(outputs_classes_one2one)
+        outputs_coords_one2one = torch.stack(outputs_coords_one2one)
+
+        outputs_classes_one2many = torch.stack(outputs_classes_one2many)
+        outputs_coords_one2many = torch.stack(outputs_coords_one2many)
+
+        out = {
+            "pred_logits": outputs_classes_one2one[-1],
+            "pred_boxes": outputs_coords_one2one[-1],
+            "pred_logits_one2many": outputs_classes_one2many[-1],
+            "pred_boxes_one2many": outputs_coords_one2many[-1],
+        }
+        if self.aux_loss:
+            out["aux_outputs"] = self._set_aux_loss(outputs_classes_one2one, outputs_coords_one2one)
+            out["aux_outputs_one2many"] = self._set_aux_loss(outputs_classes_one2many, outputs_coords_one2many)
+
+        if self.two_stage:
+            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
+            out["enc_outputs"] = {
+                "pred_logits": enc_outputs_class,
+                "pred_boxes": enc_outputs_coord,
+            }
+        return out
+
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_class, outputs_coord):
         return [{"pred_logits": a, "pred_boxes": b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
 
