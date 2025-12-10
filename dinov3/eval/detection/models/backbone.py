@@ -73,6 +73,7 @@ class DINOBackbone(nn.Module):
         self.layers_to_use = layers_to_use
 
     def forward(self, tensor_list: NestedTensor):
+
         xs = self.backbone.get_intermediate_layers(tensor_list.tensors, n=self.layers_to_use, reshape=True)
         if self.use_layernorm:
             xs = [ln(x).contiguous() for ln, x in zip(self.layer_norms, xs)]

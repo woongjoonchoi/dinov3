@@ -100,7 +100,6 @@ class DinoVisionTransformer(nn.Module):
         self.n_blocks = depth
         self.num_heads = num_heads
         self.patch_size = patch_size
-
         self.patch_embed = PatchEmbed(
             img_size=img_size,
             patch_size=patch_size,

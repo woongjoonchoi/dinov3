@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
+from torch import nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -32,7 +33,8 @@ from dinov3.hub.backbones import dinov3_vit7b16, dinov3_vitl16plus
 from dinov3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1
 from dinov3_window_base1_1.vit import _PatchOnlyWindowBlock
 from dinov3_window_base1_3 import LocalGlobalHybridVisionTransformer
-
+from dinov3.eval.detection.models.detr import PostProcess, build_model
+from dinov3.eval.detection.config import DetectionHeadConfig
 
 def _resolve_weights(value: Optional[str]) -> Optional[BackboneWeights | str]:
     """Convert CLI weight string to hub enum when possible."""
@@ -238,6 +240,7 @@ def _build_loader(
     distributed: bool,
     rank: int,
     world_size: int,
+    prefetch_factor : int = 1
 ) -> DataLoader:
     dataset = CocoDetectionForActivations(
         root=str(coco_root / split), ann_file=str(ann_file), transform=_make_transform(max_size)
@@ -255,6 +258,7 @@ def _build_loader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=_collate_coco,
+        prefetch_factor=prefetch_factor
     )
 
 
@@ -275,8 +279,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to run on.")
     parser.add_argument("--distributed", action="store_true", help="Use torch.distributed for multi-GPU extraction.")
     parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
+    parser.add_argument("--prefetch_factor", type=int, default=1 ,help="Pin dataloader memory for faster host->device copies.")
     parser.add_argument("--backbone-name", type=str, default="dinov3_vit7b16", help="Backbone name used in eval script.")
     parser.add_argument("--backbone-checkpoint", type=pathlib.Path, default=None, help="Local backbone checkpoint path.")
+    parser.add_argument("--detector-checkpoint", type=pathlib.Path, default=None, help="Local backbone checkpoint path.")
     parser.add_argument("--backbone-pretrained", action="store_true", help="Load pretrained weights when no checkpoint.")
     parser.add_argument("--backbone-weights", type=str, default=None, help="Backbone weights enum name or path.")
     parser.add_argument("--check-hash", action="store_true", help="Enable hub hash checking when loading weights.")
@@ -320,6 +326,156 @@ def _move_nested_to_device(sample: NestedTensor, device: torch.device) -> Nested
     return sample.to(device, non_blocking=True)
 
 
+def build_dinov3_detector_custom(
+    *,
+    # 1) 이미 만들어진 backbone 모듈을 직접 넘기고 싶을 때
+    backbone: Optional[nn.Module] = None,
+    # 2) 아니면 기존 dinov3 backbone 이름으로 생성
+    backbone_name: str = "dinov3_vit7b16",
+    backbone_pretrained: bool = True,
+    backbone_weights: BackboneWeights | str = BackboneWeights.LVD1689M,
+    # 3) 로컬 backbone ckpt 경로 (주어지면 이걸 우선 사용)
+    backbone_ckpt_path: Optional[str] = None,
+    # 4) detector head ckpt 로컬 경로 (옵션)
+    detector_ckpt_path: Optional[str] = None,
+    num_classes: int = 91,   # COCO 기준 91
+    check_hash: bool = False,
+    **kwargs,
+) -> nn.Module:
+    """
+    - dinov3의 _make_dinov3_detector를 기반으로,
+      - backbone은 로컬 ckpt 또는 공식 weights 둘 다 지원
+      - detector head는 로컬 ckpt에서 로딩
+    - .to(device), .eval()은 여기서 호출하지 않고, 호출하는 쪽에서 처리.
+    """
+
+    # -------------------------------
+    # 1. Detection head config 생성
+    # -------------------------------
+    detection_kwargs = dict(
+        with_box_refine=True,
+        two_stage=True,
+        mixed_selection=True,
+        look_forward_twice=True,
+        k_one2many=6,
+        lambda_one2many=1.0,
+        num_queries_one2one=1500,
+        num_queries_one2many=1500,
+        reparam=True,
+        position_embedding=PositionEncoding.SINE,
+        num_feature_levels=1,
+        dec_layers=6,
+        dim_feedforward=2048,
+        dropout=0.0,
+        norm_type="pre_norm",
+        proposal_feature_levels=4,
+        proposal_min_size=50,
+        decoder_type="global_rpe_decomp",
+        decoder_use_checkpoint=False,
+        decoder_rpe_hidden_dim=512,
+        decoder_rpe_type="linear",
+        layers_to_use=None,
+        blocks_to_train=None,
+        add_transformer_encoder=True,
+        num_encoder_layers=6,
+        backbone_use_layernorm=False,
+        num_classes=num_classes,
+        aux_loss=True,
+        topk=1500,
+        hidden_dim=768,
+        nheads=8,
+    )
+    config = DetectionHeadConfig(**detection_kwargs)
+
+    # -------------------------------
+    # 2. backbone 생성 또는 주입
+    # -------------------------------
+    n_windows_sqrt_map = {
+        "dinov3_vit7b16": 3,
+        "dinov3_vitl16plus": 2,
+    }
+    if backbone is None:
+        backbone_class_map = {
+            "dinov3_vit7b16": dinov3_vit7b16,
+            "dinov3_vitl16plus": dinov3_vitl16plus,
+            "dinov3_window_base1_1": DinoVisionTransformerWindowBaseline1_1,
+            "dinov3_window_base1_3": LocalGlobalHybridVisionTransformer,
+            "b1_1": DinoVisionTransformerWindowBaseline1_1,
+            "b1_3": LocalGlobalHybridVisionTransformer,
+        }
+
+        if backbone_name not in backbone_class_map:
+            raise ValueError(f"Unsupported backbone_name: {backbone_name}")
+
+        backbone_class = backbone_class_map[backbone_name]
+
+        # (A) 로컬 backbone ckpt를 사용하고 싶을 때
+        if backbone_ckpt_path is not None:
+            if not os.path.isfile(backbone_ckpt_path):
+                raise FileNotFoundError(
+                    f"backbone_ckpt_path not found: {backbone_ckpt_path}"
+                )
+
+            # 구조만 만들고
+            if backbone_name == "b1_1" or backbone_name == "b1_3":
+                backbone = backbone_class(
+                    pretrained=False,
+                    weights=None,
+                    window_size = 16,
+                    check_hash=check_hash,
+                )
+            else :
+                backbone = backbone_class(
+                    pretrained=False,
+                    weights=None,
+                    check_hash=check_hash,
+                )
+
+            # 로컬 ckpt에서 weight 로딩
+            b_ckpt = torch.load(backbone_ckpt_path, map_location="cpu")
+            b_state = b_ckpt["model"] if isinstance(b_ckpt, dict) and "model" in b_ckpt else b_ckpt
+            if isinstance(backbone, DinoVisionTransformerWindowBaseline1_1):
+                b_state = _remap_window_block_keys_to_patch_only(backbone, b_state)
+            backbone.load_state_dict(b_state, strict=False)
+
+        # (B) 공식 dinov3 BackboneWeights / URL 방식을 그대로 쓰고 싶을 때
+        else:
+            backbone = backbone_class(
+                pretrained=backbone_pretrained,
+                weights=backbone_weights,
+                check_hash=check_hash,
+            )
+    else:
+        # custom backbone이면 n_windows_sqrt는 속성에서 가져오고,
+        # 없으면 기본값 3
+        n_windows_sqrt = getattr(backbone, "n_windows_sqrt", 3)
+
+    if backbone is not None:
+        n_windows_sqrt = getattr(backbone, "n_windows_sqrt", n_windows_sqrt_map.get(backbone_name, 3))
+
+    # 원래 코드도 backbone은 eval()로 고정
+    backbone.eval()
+
+    config.n_windows_sqrt = n_windows_sqrt
+    config.proposal_in_stride = backbone.patch_size
+    config.proposal_tgt_strides = [
+        int(m * backbone.patch_size) for m in (0.5, 1, 2, 4)
+    ]
+
+    if config.layers_to_use is None:
+        # e.g. [2, 5, 8, 11] for a backbone with 12 blocks
+        config.layers_to_use = [m * backbone.n_blocks // 4 - 1 for m in range(1, 5)]
+
+    # -------------------------------
+    # 3. detector head 생성
+    # -------------------------------
+    detector = build_model(backbone, config)
+
+    model = detector.backbone
+
+    # 여기서는 .to(device), .eval() 호출 안 함
+    return model
+
 @torch.inference_mode()
 def _extract_and_save(
     backbone: BackboneWithPositionEncoding | DDP,
@@ -343,6 +499,9 @@ def _extract_and_save(
             out, pos = backbone(nested)
 
         batch_size = out[0].tensors.shape[0]
+        # print(f"out length : {len(out)}")
+        # print(f"out tensro shaep :{out[0].tensors.shape}")
+        # exit()
         for in_batch_idx in range(batch_size):
             single_out_tensors = [lvl.tensors[in_batch_idx].detach().cpu().clone() for lvl in out]
             single_out_masks = [lvl.mask[in_batch_idx].detach().cpu().clone() for lvl in out]
@@ -401,10 +560,28 @@ def main() -> None:
         world_size = 1
 
     print(f"Running on rank {rank} / {world_size} with device {device}")
+    model = build_dinov3_detector_custom(
+        # backbone_name="dinov3_vit7b16",
+        backbone_name=args.backbone_name,
+        backbone_pretrained=False,
+        backbone_weights=None,
+        backbone_ckpt_path=args.backbone_checkpoint,
+        detector_ckpt_path=args.detector_checkpoint,
+        num_classes=91,
+    )
+    # backbone_model, n_windows_sqrt = _build_backbone_model(args)
+    # backbone_args = _build_backbone_args(args, n_windows_sqrt)
+    # backbone_with_pe = build_backbone(backbone_model, backbone_args)
 
-    backbone_model, n_windows_sqrt = _build_backbone_model(args)
-    backbone_args = _build_backbone_args(args, n_windows_sqrt)
-    backbone_with_pe = build_backbone(backbone_model, backbone_args)
+    backbone_with_pe = build_dinov3_detector_custom(
+        # backbone_name="dinov3_vit7b16",
+        backbone_name=args.backbone_name,
+        backbone_pretrained=False,
+        backbone_weights=None,
+        backbone_ckpt_path=args.backbone_checkpoint,
+        detector_ckpt_path=args.detector_checkpoint,
+        num_classes=91,
+    )
     backbone_with_pe.to(device)
 
     # if args.distributed:

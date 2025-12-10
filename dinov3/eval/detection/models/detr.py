@@ -376,6 +376,7 @@ class PlainDETRReParam(PlainDETR):
         srcs = []
         masks = []
         for layer, feat in enumerate(features):
+            
             src, mask = feat.decompose()
             srcs.append(self.input_proj[layer](src))
             masks.append(mask)
