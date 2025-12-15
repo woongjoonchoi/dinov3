@@ -29,7 +29,7 @@ bash  docker/run_coco_eval_ddp.sh  \
   -- \
   --backbone-checkpoint  /dinov3_pth/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth \
     --detector-checkpoint  /dinov3_pth/dinov3_vit7b16_coco_detr_head-b0235ff7.pth \
-    --batch-size 5 \
+    --batch-size 25 \
   --coco-root /datasets/coco \
   --ann-file /datasets/coco/annotations/instances_val2017.json \
   --max-size 1536 \

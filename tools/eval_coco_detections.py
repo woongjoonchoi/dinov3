@@ -419,6 +419,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distributed", action="store_true", help="Use torch.distributed with torchrun for multi-GPU evaluation.")
     parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
     parser.add_argument("--max-size", type=int, default=None, help="Optional maximum size for the shortest image side; keeps aspect ratio.")
+    parser.add_argument("--prefetch-factor", type=int, default=1, help="prefetch factor.")
     parser.add_argument("--score-threshold", type=float, default=0.0, help="Discard predictions below this confidence.")
     parser.add_argument("--backbone-name" , type=str, default="dinov3_vit7b16",help="backbone-name")
     parser.add_argument(
@@ -540,6 +541,7 @@ def main() -> None:
         sampler=sampler,
         shuffle=False,
         pin_memory=args.pin_memory,
+        prefetch_factor=args.prefetch_factor
     )
     # model = _build_model_from_checkpoints(args, device)
     # model = detectors.dinov3_vit7b16_de(

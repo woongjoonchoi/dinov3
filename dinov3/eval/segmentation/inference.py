@@ -50,6 +50,7 @@ def make_inference(
         Tensor: The segmentation results created from the input image.
     """
     assert inference_mode in ["whole", "slide"]
+
     if inference_mode == "slide":
         # crop size and stride are needed for sliding inference
         assert crop_size is not None

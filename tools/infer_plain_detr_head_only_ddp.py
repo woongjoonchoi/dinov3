@@ -7,7 +7,8 @@ save the raw decoder outputs for each sample.
 """
 
 from __future__ import annotations
-
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import argparse
 import importlib
 import json
@@ -23,10 +24,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
 from dinov3.eval.detection.config import DetectionHeadConfig
 from dinov3.eval.detection.models.backbone import build_backbone
-from dinov3.eval.detection.models.detr import PlainDETR, PlainDETRHeadOnly
+from dinov3.eval.detection.models.detr import PlainDETR
 from dinov3.eval.detection.models.position_encoding import PositionEncoding
 from dinov3.eval.detection.models.transformer import build_transformer
 from dinov3.eval.detection.util.misc import inverse_sigmoid
@@ -38,7 +40,23 @@ from dinov3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1
 from dinov3_window_base1_1.vit import _PatchOnlyWindowBlock
 from dinov3_window_base1_3 import LocalGlobalHybridVisionTransformer
 from dinov3.eval.detection.models.detr import PostProcess, build_model
+from dinov3.eval.detection.util import box_ops
+from torchvision.transforms import functional as F
+from torchvision.transforms.functional import InterpolationMode
+class ResizeAllSides:
+    def __init__(self, target_size: int):
+        self.target_size = target_size
 
+    def __call__(self, image):
+        width, height = image.size  # (W, H)
+        if width == self.target_size and height == self.target_size:
+            return image
+        # F.resize expects (H, W)
+        return F.resize(
+            image,
+            (self.target_size, self.target_size),
+            interpolation=InterpolationMode.BICUBIC,
+        )
 class DetectorWithProcessor(torch.nn.Module):
     """
     takes as input a list of (3, H, W) normalized image tensors and outputs
@@ -279,6 +297,7 @@ class CocoDetectionForEval(CocoDetection):
         self.max_size = max_size
 
     def __getitem__(self, index):
+        
         image, _ = super().__getitem__(index)
         image_id = self.ids[index]
         info = self.coco.loadImgs(image_id)[0]
@@ -291,6 +310,7 @@ class CocoDetectionForEval(CocoDetection):
         resized_w, resized_h = image.size
 
         image = self.image_transform(image)
+        
         return image, {
             "image_id": int(image_id),
             "orig_size": (orig_h, orig_w),
@@ -334,6 +354,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--activation-root", type=pathlib.Path, required=True, help="Directory containing .pt activation files.")
     parser.add_argument("--checkpoint", type=pathlib.Path, required=True, help="Detection checkpoint with transformer/head weights.")
+    parser.add_argument("--score-threshold", type=float, default=0.0, help="Discard predictions below this confidence.")
     # parser.add_argument(
     #     "--dataset-builder",
     #     type=str,
@@ -359,7 +380,7 @@ def _parse_args() -> argparse.Namespace:
         help="JSON string of kwargs forwarded to the backbone builder.",
     )
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size per device.")
-    parser.add_argument("--num-workers", type=int, default=4, help="Number of dataloader workers.")
+    parser.add_argument("--num-workers", type=int, default=1, help="Number of dataloader workers.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Compute device.")
     parser.add_argument("--distributed", action="store_true", help="Use torch.distributed for multi-GPU inference.")
     parser.add_argument("--pin-memory", action="store_true", help="Pin dataloader memory for faster host->device copies.")
@@ -382,6 +403,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-rpe-hidden-dim", type=int, default=defaults.decoder_rpe_hidden_dim)
     parser.add_argument("--decoder-rpe-type", type=str, default=defaults.decoder_rpe_type)
     parser.add_argument("--look-forward-twice", action="store_true", default=defaults.look_forward_twice)
+    parser.add_argument("--prefetch", type=int,default=1, help="data prefetch.")
     parser.add_argument("--k-one2many", type=int, default=defaults.k_one2many)
     parser.add_argument("--lambda-one2many", type=float, default=defaults.lambda_one2many)
     parser.add_argument("--n-windows-sqrt", type=int, default=defaults.n_windows_sqrt)
@@ -404,8 +426,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no-aux-loss", action="store_false", dest="aux_loss", help="Disable auxiliary decoder losses.")
     parser.add_argument("--no-with-box-refine", action="store_false", dest="with_box_refine", help="Disable box refinement.")
     parser.add_argument("--one-stage", action="store_false", dest="two_stage", help="Disable two-stage transformer proposals.")
-    parser.add_argument("--no-mixed-selection", action="store_false", dest="mixed_selection", help="Disable mixed selection.")
     
+    parser.add_argument("--no-mixed-selection", action="store_false", dest="mixed_selection", help="Disable mixed selection.")
+    parser.add_argument("--max-size", type=int, default=1536, help="Optional maximum size for the shortest image side; keeps aspect ratio.")
     parser.set_defaults(
         aux_loss=defaults.aux_loss,
         with_box_refine=defaults.with_box_refine,
@@ -504,6 +527,40 @@ class PlainDETRHeadOnly(nn.Module):
             outputs_coords_one2one.append(outputs_coord[:, 0 : self.num_queries_one2one])
             outputs_coords_one2many.append(outputs_coord[:, self.num_queries_one2one :])
 
+
+        outputs_classes_one2one = []
+        outputs_coords_one2one = []
+        outputs_classes_one2many = []
+        outputs_coords_one2many = []
+
+        outputs_coords_old_one2one = []
+        outputs_deltas_one2one = []
+        outputs_coords_old_one2many = []
+        outputs_deltas_one2many = []
+
+        for lvl in range(hs.shape[0]):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+            outputs_class = self.class_embed[lvl](hs[lvl])
+            tmp = self.bbox_embed[lvl](hs[lvl])
+            if reference.shape[-1] == 4:
+                outputs_coord = box_ops.box_xyxy_to_cxcywh(box_ops.delta2bbox(reference, tmp, max_shape))
+            else:
+                raise NotImplementedError
+
+            outputs_classes_one2one.append(outputs_class[:, 0 : self.num_queries_one2one])
+            outputs_classes_one2many.append(outputs_class[:, self.num_queries_one2one :])
+
+            outputs_coords_one2one.append(outputs_coord[:, 0 : self.num_queries_one2one])
+            outputs_coords_one2many.append(outputs_coord[:, self.num_queries_one2one :])
+
+            outputs_coords_old_one2one.append(reference[:, : self.num_queries_one2one])
+            outputs_coords_old_one2many.append(reference[:, self.num_queries_one2one :])
+            outputs_deltas_one2one.append(tmp[:, : self.num_queries_one2one])
+            outputs_deltas_one2many.append(tmp[:, self.num_queries_one2one :])
+
         outputs_classes_one2one = torch.stack(outputs_classes_one2one)
         outputs_coords_one2one = torch.stack(outputs_coords_one2one)
 
@@ -515,26 +572,43 @@ class PlainDETRHeadOnly(nn.Module):
             "pred_boxes": outputs_coords_one2one[-1],
             "pred_logits_one2many": outputs_classes_one2many[-1],
             "pred_boxes_one2many": outputs_coords_one2many[-1],
+            "pred_boxes_old": outputs_coords_old_one2one[-1],
+            "pred_deltas": outputs_deltas_one2one[-1],
+            "pred_boxes_old_one2many": outputs_coords_old_one2many[-1],
+            "pred_deltas_one2many": outputs_deltas_one2many[-1],
         }
+
         if self.aux_loss:
-            out["aux_outputs"] = self._set_aux_loss(outputs_classes_one2one, outputs_coords_one2one)
-            out["aux_outputs_one2many"] = self._set_aux_loss(outputs_classes_one2many, outputs_coords_one2many)
+            out["aux_outputs"] = self._set_aux_loss(
+                outputs_classes_one2one, outputs_coords_one2one, outputs_coords_old_one2one, outputs_deltas_one2one
+            )
+            out["aux_outputs_one2many"] = self._set_aux_loss(
+                outputs_classes_one2many, outputs_coords_one2many, outputs_coords_old_one2many, outputs_deltas_one2many
+            )
 
         if self.two_stage:
-            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out["enc_outputs"] = {
                 "pred_logits": enc_outputs_class,
-                "pred_boxes": enc_outputs_coord,
+                "pred_boxes": enc_outputs_coord_unact,
+                "pred_boxes_old": output_proposals,
+                "pred_deltas": enc_outputs_delta,
             }
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_coord_old, outputs_deltas):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{"pred_logits": a, "pred_boxes": b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
-
+        return [
+            {
+                "pred_logits": a,
+                "pred_boxes": b,
+                "pred_boxes_old": c,
+                "pred_deltas": d,
+            }
+            for a, b, c, d in zip(outputs_class[:-1], outputs_coord[:-1], outputs_coord_old[:-1], outputs_deltas[:-1])
+        ]
 
 class ActivationDetDataset(Dataset):
     """Dataset wrapper that loads cached backbone activations from disk."""
@@ -547,8 +621,10 @@ class ActivationDetDataset(Dataset):
         return len(self.base)
 
     def __getitem__(self, idx: int):
+        
         _, target = self.base[idx]
 
+        
         file_name = target["file_name"]
 
         act_path = (self.activation_root / file_name).with_suffix(".pt")
@@ -563,22 +639,25 @@ class ActivationDetDataset(Dataset):
         pos_list = [p.unsqueeze(0) for p in pos]
 
         meta = act.get("meta", {})
+        # print(f"start")
         return srcs, masks, pos_list, target, meta
 
 
 def collate_activations(batch):
     """Stack per-level activations along the batch dimension."""
-
-    batch_size = len(batch)
+    # print(f"collate start")
+    batch_size = len(batch) 
     num_levels = len(batch[0][0])
 
     all_srcs: List[torch.Tensor] = []
     all_masks: List[torch.Tensor] = []
     all_pos: List[torch.Tensor] = []
-    print(f"src shape :{batch[0][0][0]}")
-    print(f"mask shape :{batch[0][1][0]}")
-    print(f"pos shape :{batch[0][2][0]}")
-    exit()
+    # print(f"src shape :{batch[0][0][0].shape}")
+    # print(f"mask shape :{batch[0][1][0].shape}")
+    # print(f"pos shape :{batch[0][2][0].shape}")
+    # print(f"target :{batch[0][3]}")
+    # print(f"meta :{batch[0][4]}")
+    # exit()
     for lvl in range(num_levels):
         # print()
         src_level = [batch[i][0][lvl] for i in range(batch_size)]
@@ -627,6 +706,7 @@ def build_activation_dataloader(
     activation_root: Union[str, pathlib.Path],
     batch_size: int,
     num_workers: int,
+    prefetch : int,
     *,
     shuffle: bool = False,
     pin_memory: bool = True,
@@ -643,6 +723,7 @@ def build_activation_dataloader(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        prefetch_factor=prefetch,
         collate_fn=collate_activations,
     )
 
@@ -711,44 +792,161 @@ def _split_outputs(outputs: Dict[str, Any], batch_index: int) -> Dict[str, Any]:
         }
     return per_item
 
+def evaluate_predictions(coco_gt: COCO, predictions: List[dict]) -> None:
+    if len(predictions) == 0:
+        raise RuntimeError("No predictions were produced; cannot run COCO evaluation.")
+
+    coco_dt = coco_gt.loadRes(predictions)
+    evaluator = COCOeval(coco_gt, coco_dt, iouType="bbox")
+    evaluator.params.imgIds = coco_gt.getImgIds()
+    evaluator.evaluate()
+    evaluator.accumulate()
+    evaluator.summarize()
+
+def evaluate_predictions_with_logging(
+    coco_gt: COCO,
+    predictions: List[dict],
+    *,
+    iteration: int | None = None,
+    require_nonempty: bool = True,
+) -> None:
+    prefix = "Final" if iteration is None else f"Iteration {iteration}"
+    if len(predictions) == 0:
+        message = f"{prefix}: no predictions; skipping evaluation"
+        if require_nonempty:
+            raise RuntimeError(message)
+        print(message)
+        return
+
+    print(f"{prefix}: evaluating {len(predictions)} predictions")
+    evaluate_predictions(coco_gt, predictions)
+
 
 @torch.inference_mode()
 def _run_inference(
     model: torch.nn.Module,
+    postprocessor,
     loader,
     device: torch.device,
+    args,
+    dataset,
+    world_size,
     *,
     output_dir: pathlib.Path | None,
     rank: int,
 ) -> None:
-    if output_dir is not None and rank == 0:
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-    for srcs, masks, pos, targets, metas in tqdm(loader):
-        print(f"srcs shaep :{type(srcs)}")
-        print(f"masks shaep :{type(masks)}")
-        print(f"pos shaep :{type(pos)}")
+    # if output_dir is not None and rank == 0:
+    #     output_dir.mkdir(parents=True, exist_ok=True)
+    score_threshold=0.0
+    predictions_all: List[dict] = []
+    # if rank == 0 :
+    #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+    #     print(f"0 iter dataloader start")
+    #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35    
+    for iteration , (srcs, masks, pos, targets, metas) in enumerate(tqdm(loader)):
+        # print(f"srcs shaep :{type(srcs)}")
+        # print(f"masks shaep :{type(masks)}")
+        # print(f"pos shaep :{type(pos)}")
         # print(f"srcs shape :srcs")
-        exit()
+        # exit()
+        # if rank == 0 :
+        #     print(f"{iteration} iter dataloader end")
+        #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+        #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35
+        #     print(f"{iteration} iter data prep start ")
+        #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+        #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35
         srcs = [s.to(device, non_blocking=True) for s in srcs]
         masks = [m.to(device, non_blocking=True) for m in masks]
         pos = [p.to(device, non_blocking=True) for p in pos]
-
+        # if rank == 0 :
+        #     print(f"{iteration} iter data prep end")
+        #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+        #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35
+        #     print(f"{iteration} iter model infer start ")
+        #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+        #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35
         outputs = model(srcs, masks, pos)
+        # if rank == 0 :
+        #     print(f"{iteration} iter model infer end")
+        #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+        #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35
+        #     print(f"{iteration} iter postproces start ")
+        #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+        #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35            
+        resized_sizes = torch.tensor(
+            [m["resized_size"] for m in targets],
+            device=srcs[0].device,
+            dtype=outputs["pred_boxes"].dtype,
+        )
+        orig_sizes = torch.tensor(
+            [m["orig_size"] for m in targets],
+            device=srcs[0].device,
+            dtype=outputs["pred_boxes"].dtype,
+        )
 
-        if output_dir is None or rank != 0:
-            continue
+        outputs = postprocessor(
+            outputs,
+            target_sizes=resized_sizes,
+            original_target_sizes=orig_sizes,
+        )
+        # if rank == 0 :
+        #     print(f"{iteration} iter postproces end ")
+        #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+        #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35
+        #     print(f"{iteration} iter det eval start ")
+        #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+        #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35            
+        for output, meta in zip(outputs, metas):
+            boxes = output["boxes"].cpu()
+            scores = output["scores"].cpu()
+            labels = output["labels"].cpu()
 
-        batch_size = len(targets)
-        for idx in range(batch_size):
-            target = targets[idx]
-            meta = metas[idx]
-            file_name = meta.get("file_name", target.get("file_name", f"sample_{idx}"))
-            file_path = pathlib.Path(file_name)
-            save_path = (output_dir / file_path).with_suffix(".pt")
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(_split_outputs(outputs, idx), save_path)
+            # h_orig, w_orig = meta["orig_size"]
+            # h_resized, w_resized = meta["resized_size"]
+            # scale_x = w_orig / w_resized
+            # scale_y = h_orig / h_resized
 
+            # boxes = boxes.clone()
+            # boxes[:, [0, 2]] *= scale_x
+            # boxes[:, [1, 3]] *= scale_y
+            batch_predictions: List[dict] = []
+            for box, score, label in zip(boxes, scores, labels):
+                if score < score_threshold:
+                    continue
+
+                x_min, y_min, x_max, y_max = box.tolist()
+                coco_box = [x_min, y_min, x_max - x_min, y_max - y_min]
+                batch_predictions.append(
+                    {
+                        "image_id": meta["image_id"],
+                        # "category_id": id_map.get(int(label), int(label)),
+                        "category_id": int(label),
+                        "bbox": coco_box,
+                        "score": float(score),
+                    }
+                )
+        if args.distributed:
+            gathered_batches: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore[list-item]
+            dist.all_gather_object(gathered_batches, batch_predictions)
+            if rank == 0:
+                merged_batch = [pred for sublist in gathered_batches for pred in sublist]
+                predictions_all.extend(merged_batch)
+                evaluate_predictions_with_logging(
+                    dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
+                )
+        else:
+            predictions_all.extend(batch_predictions)
+            evaluate_predictions_with_logging(
+                dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
+            )                
+        # if rank == 0 :                
+        #     print(f"{iteration} iter det eval end ")
+        #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+        #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35
+        #     print(f"{iteration+1} iter dataloader start ")
+        #     now = datetime.now(ZoneInfo("Asia/Seoul"))
+        #     print(now.strftime("%Y-%m-%d %H:%M:%S"))  # 2025-12-10 13:24:35                
 
 def main() -> None:
     args = _parse_args()
@@ -795,7 +993,7 @@ def main() -> None:
     #     raise FileNotFoundError(f"Detector checkpoint not found: {args.detector_checkpoint}")
 
     base_dataset = CocoDetectionForEval(
-        root=str(image_root), ann_file=str(ann_file), transform=build_transform()
+        root=str(image_root), ann_file=str(ann_file), transform=build_transform() ,max_size=args.max_size
     )
     
     model , postprocessor = build_head_only_model(config ,args.backbone_name,args.checkpoint, device )
@@ -812,13 +1010,14 @@ def main() -> None:
         args.activation_root,
         args.batch_size,
         args.num_workers,
+        args.prefetch,
         shuffle=False,
         pin_memory=args.pin_memory,
         sampler=sampler,
         dataset=activation_dataset,
     )
 
-    _run_inference(model, loader, device, output_dir=args.output_dir, rank=rank)
+    _run_inference(model,postprocessor ,loader, device,args, base_dataset,world_size,output_dir=args.output_dir, rank=rank)
 
     if args.distributed:
         dist.barrier()

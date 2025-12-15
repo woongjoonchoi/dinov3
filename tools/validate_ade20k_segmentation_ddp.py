@@ -87,6 +87,9 @@ def _run_validation(
     autocast_dtype: torch.dtype,
     log_interval: int,
 ) -> dict[str, float]:
+    # print(f"eval_stride :{eval_stride}")
+    # print(f"eval_res :{eval_res}")
+    # exit()
     model.eval()
     device = next(model.parameters()).device
     metric_logger = MetricLogger(delimiter="  ")
@@ -103,38 +106,68 @@ def _run_validation(
             gt_batch = torch.stack([torch.as_tensor(target) for target in gt]).to(device)
         else:
             raise TypeError(f"Unsupported ground truth format: {type(gt)}")
-
-        per_sample_views = _split_batch_views(batch_img, batch_size=gt_batch.shape[0])
-
+        # print(f"batch_img shape :{batch_img[0].shape}")
+        # per_sample_views = _split_batch_views(batch_img, batch_size=gt_batch.shape[0])
+        # print(f"per_sample_viess shape : {per_sample_views[0][0].shape}")
+        # exit()
         inference_model = model.module if isinstance(model, DDP) else model
-        for sample_views, gt_sample in zip(per_sample_views, gt_batch):
-            sample_views = [img.to(device).to(dtype=autocast_dtype) for img in sample_views]
-            aggregated_preds = torch.zeros(
-                1, num_classes, gt_sample.shape[-2], gt_sample.shape[-1], device=device
-            )
+        # for sample_views, gt_sample in zip(per_sample_views, gt_batch):
+        #     sample_views = [img.to(device).to(dtype=autocast_dtype) for img in sample_views]
+        #     aggregated_preds = torch.zeros(
+        #         1, num_classes, gt_sample.shape[-2], gt_sample.shape[-1], device=device
+        #     )
 
-            for img_idx, img in enumerate(sample_views):
-                aggregated_preds += make_inference(
-                    img,
-                    inference_model,
-                    inference_mode="slide",
-                    decoder_head_type=decoder_head_type,
-                    rescale_to=gt_sample.shape[-2:],
-                    n_output_channels=num_classes,
-                    crop_size=(eval_res, eval_res),
-                    stride=(eval_stride, eval_stride),
-                    apply_horizontal_flip=(img_idx and img_idx >= len(sample_views) / 2),
-                    output_activation=lambda x: torch.nn.functional.softmax(x, dim=1),
-                )
+        #     for img_idx, img in enumerate(sample_views):
+        #         aggregated_preds += make_inference(
+        #             img,
+        #             inference_model,
+        #             inference_mode="slide",
+        #             decoder_head_type=decoder_head_type,
+        #             rescale_to=gt_sample.shape[-2:],
+        #             n_output_channels=num_classes,
+        #             crop_size=(eval_res, eval_res),
+        #             # stride=(eval_stride, eval_stride),
+        #             stride=(eval_res, eval_res),
+        #             apply_horizontal_flip=(img_idx and img_idx >= len(sample_views) / 2),
+        #             output_activation=lambda x: torch.nn.functional.softmax(x, dim=1),
+        #         )
 
-            aggregated_preds = (aggregated_preds / len(sample_views)).argmax(dim=1, keepdim=True)
-            intersect_and_union = calculate_intersect_and_union(
-                aggregated_preds[0],
-                gt_sample,
-                num_classes=num_classes,
-                reduce_zero_label=True,
+        #     aggregated_preds = (aggregated_preds / len(sample_views)).argmax(dim=1, keepdim=True)
+        #     intersect_and_union = calculate_intersect_and_union(
+        #         aggregated_preds[0],
+        #         gt_sample,
+        #         num_classes=num_classes,
+        #         reduce_zero_label=True,
+        #     )
+        #     intersections.append(intersect_and_union)
+
+        batch_img = [img.to(device).to(dtype=autocast_dtype) for img in batch_img]
+        gt = gt.to(device)[0]
+        # print(f"batchh img shape :{batch_img[0].shape}")
+        # exit()
+        aggregated_preds = torch.zeros(1, num_classes, gt.shape[-2], gt.shape[-1])
+        for img_idx, img in enumerate(batch_img):
+            aggregated_preds += make_inference(
+                img,
+                inference_model,
+                inference_mode="slide",
+                decoder_head_type=decoder_head_type,
+                rescale_to=gt.shape[-2:],
+                n_output_channels=num_classes,
+                crop_size=(eval_res, eval_res),
+                stride=(eval_res, eval_res),
+                apply_horizontal_flip=(img_idx and img_idx >= len(batch_img) / 2),
+                # output_activation=partial(torch.nn.functional.softmax, dim=1),
+                output_activation=lambda x: torch.nn.functional.softmax(x, dim=1),
             )
-            intersections.append(intersect_and_union)
+        aggregated_preds = (aggregated_preds / len(batch_img)).argmax(dim=1, keepdim=True).to(device)
+        intersect_and_union = calculate_intersect_and_union(
+            aggregated_preds[0],
+            gt,
+            num_classes=num_classes,
+            reduce_zero_label=True,
+        )
+        intersections.append(intersect_and_union)
 
         if iteration % log_interval == 0:
             metrics = _summarize_metrics(torch.stack(intersections))
@@ -322,7 +355,10 @@ def _load_segmentation_head_state_dict(path: str) -> dict:
 def main() -> int:
     args = parse_args()
     config = _build_config(args)
-
+    config.eval.crop_size=(args.eval_size,args.eval_size)
+    # print(config.eval)
+    # print(f"config eval crop :{config.eval.crop_size}")
+    # exit()
     with job_context(output_dir=str(args.output_dir), distributed_enabled=args.distributed):
         device = torch.device(
             f"cuda:{distributed.get_rank()}" if torch.cuda.is_available() else "cpu"

@@ -1,6 +1,3 @@
-# syntax=docker/dockerfile:1
-# FROM pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
-# FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
 FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
 # 기본 툴 + Python 3.11 설치 (PPA 없이)
