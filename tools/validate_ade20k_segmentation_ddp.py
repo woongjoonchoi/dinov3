@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Iterable
+from typing import Dict, Iterable
 
 import torch
 from omegaconf import OmegaConf
@@ -31,8 +31,80 @@ from dinov3.eval.setup import load_model_and_context
 from dinov3.hub.segmentors import dinov3_vit7b16_ms
 from dinov3.logging import MetricLogger
 from dinov3.run.init import job_context
+from dinov3.models import init_fp8
+from dinov3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1, _PatchOnlyWindowBlock
+from dinov3_window_base1_3 import LocalGlobalHybridVisionTransformer
 
 logger = logging.getLogger("dinov3")
+
+
+def _load_state_dict(path: Path | str) -> Dict[str, torch.Tensor]:
+    checkpoint = torch.load(path, map_location="cpu")
+    if isinstance(checkpoint, dict):
+        for key in ("model", "state_dict", "model_state_dict"):
+            if key in checkpoint:
+                checkpoint = checkpoint[key]
+                break
+
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"Unexpected checkpoint structure in {path}")
+
+    if any(k.startswith("module.") for k in checkpoint):
+        checkpoint = {k.removeprefix("module."): v for k, v in checkpoint.items()}
+    return checkpoint
+
+
+def _remap_window_block_keys_to_patch_only(
+    model: DinoVisionTransformerWindowBaseline1_1, state_dict: Dict[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    """Adapt checkpoints from pre-patch-only window blocks."""
+
+    window_block_indices = [i for i, blk in enumerate(model.blocks) if isinstance(blk, _PatchOnlyWindowBlock)]
+    if not window_block_indices:
+        return state_dict
+
+    remapped: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        new_key = key
+        for idx in window_block_indices:
+            prefix = f"blocks.{idx}."
+            nested_prefix = f"blocks.{idx}.patch_block."
+            if key.startswith(nested_prefix):
+                break
+            if key.startswith(prefix):
+                new_key = nested_prefix + key[len(prefix) :]
+                break
+        remapped[new_key] = value
+    return remapped
+
+
+def _build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
+    """Build a backbone based on ``args.backbone_name`` with optional FP8 conversion."""
+
+    backbone_name = args.backbone_name
+    apply_fp8 = backbone_name.endswith("-fp8")
+    args.fp8_enabled = apply_fp8
+    args.fp8_filter = getattr(args, "fp8_filter", None)
+
+    if backbone_name in {"baseline1-1", "baseline1-1-fp8"}:
+        backbone = DinoVisionTransformerWindowBaseline1_1(**args.model_kwargs)
+        state_dict = _remap_window_block_keys_to_patch_only(
+            backbone, _load_state_dict(args.backbone_checkpoint)
+        )
+    elif backbone_name in {"baseline1-3", "baseline1-3-fp8"}:
+        backbone = LocalGlobalHybridVisionTransformer(**args.model_kwargs)
+        state_dict = _load_state_dict(args.backbone_checkpoint)
+    else:
+        raise ValueError(f"Unsupported backbone_name: {backbone_name}")
+
+    backbone.load_state_dict(state_dict, strict=True)
+
+    # Keep the model on CPU while reshaping modules for FP8, then move to the target device for DDP.
+    if apply_fp8:
+        backbone = init_fp8(backbone, args)
+
+    backbone.to(device)
+    return backbone
 
 
 @torch.inference_mode()
@@ -214,7 +286,7 @@ def _build_config(args: argparse.Namespace) -> SegmentationConfig:
     return OmegaConf.to_object(merged)
 
 
-def _build_model(config: SegmentationConfig, device: torch.device, use_ddp: bool):
+def _build_segmentation_model(config: SegmentationConfig, device: torch.device, use_ddp: bool):
     if config.load_from == "dinov3_vit7b16_ms":
         logger.info("Loading dinov3_vit7b16_ms segmentation head via torch hub.")
         segmentation_model = dinov3_vit7b16_ms(
@@ -371,7 +443,7 @@ def main() -> int:
         device = torch.device(
             f"cuda:{distributed.get_rank()}" if torch.cuda.is_available() else "cpu"
         )
-        segmentation_model = _build_model(config, device=device, use_ddp=args.distributed)
+        segmentation_model = _build_segmentation_model(config, device=device, use_ddp=args.distributed)
         dataloader = _build_dataloader(config, pin_memory=args.pin_memory, batch_size=args.batch_size)
         _ = _run_validation(
             segmentation_model,
