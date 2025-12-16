@@ -148,7 +148,9 @@ def _remap_window_block_keys_to_patch_only(model, state_dict: Dict[str, torch.Te
     return remapped
 
 
-def _build_model_from_checkpoints(args: argparse.Namespace, device: torch.device) -> nn.Module:
+def _build_model_from_checkpoints(args: argparse.Namespace, device: torch.device,num_classes=91) -> nn.Module:
+    # print(f"num_classes: {num_classes}")
+    # exit()
     detection_kwargs = dict(
         with_box_refine=True,
         two_stage=True,
@@ -177,6 +179,7 @@ def _build_model_from_checkpoints(args: argparse.Namespace, device: torch.device
         num_encoder_layers=6,
         backbone_use_layernorm=False,
         num_classes=91,
+        # num_classes=num_classes,
         aux_loss=True,
         topk=1500,
         hidden_dim=768,
@@ -364,6 +367,10 @@ class SetCriterion(nn.Module):
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(src_logits.shape[:2], self.num_classes, device=src_logits.device, dtype=torch.int64)
         target_classes[idx] = target_classes_o
+        # print(f"empty_weight shape :{self.empty_weight.shape}")
+        # print(f"src_logits shape :{src_logits.shape}") 
+        # exit()
+
         loss_ce = nn.functional.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         losses = {"loss_ce": loss_ce}
         return losses
@@ -382,8 +389,12 @@ class SetCriterion(nn.Module):
 
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
         tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=outputs["pred_logits"].device)
-        card_pred = (outputs["pred_logits"].sigmoid() > 0.5).sum(1).cpu()
-        card_err = nn.functional.l1_loss(card_pred, tgt_lengths, reduction="none")
+        pred_logits = outputs["pred_logits"]
+        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
+
+        # 4. Loss 계산
+        # card_pred를 float로 변환하여 정답과 비교
+        card_err = nn.functional.l1_loss(card_pred.float(), tgt_lengths.float())
         losses = {"cardinality_error": card_err.sum() / outputs["pred_logits"].shape[0]}
         return losses
 
@@ -490,7 +501,8 @@ def evaluate(
                 for box, score, label in zip(boxes, scores, labels):
                     x_min, y_min, x_max, y_max = box.tolist()
                     coco_box = [x_min, y_min, x_max - x_min, y_max - y_min]
-                    coco_label = int(label_map.get(int(label), int(label)))
+                    # coco_label = int(label_map.get(int(label), int(label)))
+                    coco_label = int(label)
                     predictions_all.append(
                         {"image_id": image_id, "category_id": coco_label, "bbox": coco_box, "score": float(score)}
                     )
@@ -639,6 +651,10 @@ def main() -> None:
     train_dataset = CocoDetectionWithTargets(str(train_root), str(train_ann), transform=build_transform(), max_size=args.max_size)
     val_dataset = CocoDetectionWithTargets(str(val_root), str(val_ann), transform=build_transform(), max_size=args.max_size)
 
+    # num_classes = len(train_dataset.coco.getCatIds())
+    # print("num_classes from COCO:", num_classes)
+    # exit()
+
     train_sampler = None
     val_sampler = None
     if args.distributed:
@@ -669,7 +685,10 @@ def main() -> None:
     if args.wandb_run_name is None:
         args.wandb_run_name = make_wandb_run_name(args)
 
-    model = _build_model_from_checkpoints(args, device)
+    model = _build_model_from_checkpoints(args, device,
+                                        #   num_classes=num_classes
+                                        
+                                          )
 
     # Freeze backbone parameters
     if hasattr(model.detector, "backbone"):
@@ -685,7 +704,10 @@ def main() -> None:
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
     num_decoder_layers = len(model.detector.transformer.decoder.layers)
-    criterion, weight_dict = build_criterion(num_classes=91, num_decoder_layers=num_decoder_layers)
+    criterion, weight_dict = build_criterion(
+        # num_classes=num_classes, 
+        num_classes=90,
+        num_decoder_layers=num_decoder_layers)
     criterion.to(device)
 
 
@@ -704,7 +726,9 @@ def main() -> None:
     global_step = 0
 
     if args.distributed:
-        model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
+        model = DDP(model, device_ids=[device] if device.type == "cuda" else None,
+                    find_unused_parameters=True
+                    )
     for epoch in range(1, args.epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
