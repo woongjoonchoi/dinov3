@@ -32,7 +32,8 @@ from dinov3.hub.segmentors import dinov3_vit7b16_ms
 from dinov3.logging import MetricLogger
 from dinov3.run.init import job_context
 from dinov3.models import init_fp8
-from dinov3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1, _PatchOnlyWindowBlock
+from dinov3_window_base1_1 import DinoVisionTransformerWindowBaseline1_1
+from dinov3_window_base1_1.vit import _PatchOnlyWindowBlock
 from dinov3_window_base1_3 import LocalGlobalHybridVisionTransformer
 
 logger = logging.getLogger("dinov3")
