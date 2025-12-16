@@ -220,7 +220,8 @@ def build_dinov3_detector_custom(
 
     if backbone is not None:
         n_windows_sqrt = getattr(backbone, "n_windows_sqrt", n_windows_sqrt_map.get(backbone_name, 3))
-
+    # print(f"backbone : {backbone }")
+    # exit()
     # 원래 코드도 backbone은 eval()로 고정
     backbone.eval()
 

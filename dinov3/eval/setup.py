@@ -32,6 +32,7 @@ class BaseModelContext(TypedDict):
 
 
 def load_model_and_context(model_config: ModelConfig, output_dir: str) -> tuple[torch.nn.Module, BaseModelContext]:
+
     if model_config.dino_hub is not None:
         assert model_config.pretrained_weights is None and model_config.config_file is None
         if "dinov3" in model_config.dino_hub:

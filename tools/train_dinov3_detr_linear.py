@@ -19,8 +19,6 @@ from torchvision import transforms
 from torchvision.datasets import CocoDetection
 from torchvision.transforms import functional as F
 from torchvision.transforms.functional import (
-    IMAGENET_DEFAULT_MEAN,
-    IMAGENET_DEFAULT_STD,
     InterpolationMode,
 )
 from tqdm import tqdm
@@ -33,6 +31,9 @@ from dinov3.eval.detection.models.detr import PostProcess, build_model
 from dinov3.eval.detection.models.position_encoding import PositionEncoding
 from dinov3.eval.detection.util import box_ops
 
+
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 def make_wandb_run_name(args: argparse.Namespace) -> str:
     prefix = getattr(args, "experiment_name", None) or "coco-detr"
@@ -687,8 +688,6 @@ def main() -> None:
     criterion, weight_dict = build_criterion(num_classes=91, num_decoder_layers=num_decoder_layers)
     criterion.to(device)
 
-    if args.distributed:
-        model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
 
     num_classes_meta = getattr(model.detector, "num_classes", 91)
     meta = _RunMetadata(
@@ -704,6 +703,8 @@ def main() -> None:
 
     global_step = 0
 
+    if args.distributed:
+        model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
     for epoch in range(1, args.epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)

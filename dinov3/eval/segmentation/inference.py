@@ -132,6 +132,8 @@ def slide_inference(
             y1 = max(y2 - h_crop, 0)
             x1 = max(x2 - w_crop, 0)
             crop_img = inputs[:, :, y1:y2, x1:x2]
+            # print(f"crop_img shape :{crop_img.shape}")
+            # exit()
             crop_pred = segmentation_model.predict(crop_img, rescale_to=crop_img.shape[2:])
             if decoder_head_type == "m2f":
                 mask_pred, mask_cls = crop_pred["pred_masks"], crop_pred["pred_logits"]

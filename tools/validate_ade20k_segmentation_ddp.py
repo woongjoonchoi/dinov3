@@ -146,6 +146,8 @@ def _run_validation(
         # print(f"batchh img shape :{batch_img[0].shape}")
         # exit()
         aggregated_preds = torch.zeros(1, num_classes, gt.shape[-2], gt.shape[-1])
+        # print(f"eval_res :{eval_res}")
+        # print(f"eval_res :{eval_res}")
         for img_idx, img in enumerate(batch_img):
             aggregated_preds += make_inference(
                 img,
@@ -154,8 +156,10 @@ def _run_validation(
                 decoder_head_type=decoder_head_type,
                 rescale_to=gt.shape[-2:],
                 n_output_channels=num_classes,
-                crop_size=(eval_res, eval_res),
-                stride=(eval_res, eval_res),
+                # crop_size=(eval_res, eval_res),
+                # stride=(eval_res, eval_res),
+                crop_size=eval_res,
+                stride=eval_res,
                 apply_horizontal_flip=(img_idx and img_idx >= len(batch_img) / 2),
                 # output_activation=partial(torch.nn.functional.softmax, dim=1),
                 output_activation=lambda x: torch.nn.functional.softmax(x, dim=1),
@@ -227,7 +231,10 @@ def _build_model(config: SegmentationConfig, device: torch.device, use_ddp: bool
                 "When loading a local segmentation checkpoint, please pass --model-config "
                 "to specify the backbone config file or --backbone-hub for a hub model."
             )
+
         backbone, _ = load_model_and_context(config.model, output_dir=config.output_dir)
+        # print(backbone)
+        # exit()
         segmentation_model = build_segmentation_decoder(
             backbone,
             config.decoder_head.backbone_out_layers,
@@ -237,6 +244,7 @@ def _build_model(config: SegmentationConfig, device: torch.device, use_ddp: bool
             autocast_dtype=config.model_dtype.autocast_dtype,
             dropout=config.decoder_head.dropout,
         )
+
         state_dict = _load_segmentation_head_state_dict(config.load_from)
         segmentation_model.load_state_dict(state_dict, strict=False)
     segmentation_model = segmentation_model.to(device)
