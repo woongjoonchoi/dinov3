@@ -105,6 +105,8 @@ def _build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Mod
         backbone = init_fp8(backbone, args)
 
     backbone.to(device)
+    print(backbone)
+    exit()
     return backbone
 
 

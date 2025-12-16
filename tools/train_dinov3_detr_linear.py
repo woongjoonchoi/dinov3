@@ -29,7 +29,7 @@ from dinov3.hub.backbones import dinov3_vit7b16, dinov3_vitl16plus
 from dinov3.eval.detection.config import DetectionHeadConfig
 from dinov3.eval.detection.models.detr import PostProcess, build_model
 from dinov3.eval.detection.models.position_encoding import PositionEncoding
-from dinov3.eval.detection.util import box_ops
+from detr_utils import box_ops
 
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
