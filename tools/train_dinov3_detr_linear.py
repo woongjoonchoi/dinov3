@@ -488,6 +488,7 @@ def evaluate(
             targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
+            batch_predictions: List[dict] = []
             weight_dict = criterion.weight_dict
             loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
             losses_total += loss.item()
@@ -503,9 +504,27 @@ def evaluate(
                     coco_box = [x_min, y_min, x_max - x_min, y_max - y_min]
                     # coco_label = int(label_map.get(int(label), int(label)))
                     coco_label = int(label)
-                    predictions_all.append(
+                    batch_predictions.append(
                         {"image_id": image_id, "category_id": coco_label, "bbox": coco_box, "score": float(score)}
                     )
+                    # predictions_all.append(
+                    #     {"image_id": image_id, "category_id": coco_label, "bbox": coco_box, "score": float(score)}
+                    # )
+
+            if distributed:
+                gathered_batches: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore[list-item]
+                dist.all_gather_object(gathered_batches, batch_predictions)
+                if rank == 0:
+                    merged_batch = [pred for sublist in gathered_batches for pred in sublist]
+                    predictions_all.extend(merged_batch)
+                    evaluate_predictions_with_logging(
+                        dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
+                    )
+            else:
+                predictions_all.extend(batch_predictions)
+                evaluate_predictions_with_logging(
+                    dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
+                )
 
     total_tensor = torch.tensor([losses_total], device=device)
     if distributed:
@@ -555,7 +574,7 @@ def train_one_epoch(
             [p for p in model.parameters() if p.requires_grad], max_norm=0.1
         )
         optimizer.step()
-
+        
         if global_step % log_interval == 0 and wandb is not None:
             log_data = {"train/loss": losses.item()}
             for k, v in loss_dict.items():
@@ -566,6 +585,7 @@ def train_one_epoch(
                     log_data[f"train/lr_group_{i}"] = g["lr"]
             wandb.log(log_data, step=global_step)
         global_step += 1
+        return global_step
     return global_step
 
 
