@@ -468,6 +468,25 @@ def evaluate_predictions(coco_gt: COCO, predictions: List[dict]) -> Dict[str, fl
     return {f"val/{k}": float(v) for k, v in zip(keys, stats)}
 
 
+def evaluate_predictions_with_logging(
+    coco_gt: COCO,
+    predictions: List[dict],
+    *,
+    iteration: int | None = None,
+    require_nonempty: bool = True,
+) -> None:
+    prefix = "Final" if iteration is None else f"Iteration {iteration}"
+    if len(predictions) == 0:
+        message = f"{prefix}: no predictions; skipping evaluation"
+        if require_nonempty:
+            raise RuntimeError(message)
+        print(message)
+        return
+
+    print(f"{prefix}: evaluating {len(predictions)} predictions")
+    evaluate_predictions(coco_gt, predictions)
+
+
 def evaluate(
     model: DetectorWithPostProcess,
     criterion: SetCriterion,
@@ -482,8 +501,9 @@ def evaluate(
     base_model = model.module if isinstance(model, DDP) else model
     predictions_all: List[dict] = []
     losses_total = 0.0
+    dataset = dataloader.dataset
     with torch.no_grad():
-        for images, targets in tqdm(dataloader, desc="Validating", total=len(dataloader)):
+        for iteration, (images, targets) in enumerate(tqdm(dataloader, desc="Validating", total=len(dataloader)), start=1):
             images = [img.to(device) for img in images]
             targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
             outputs = model(images)
@@ -492,6 +512,7 @@ def evaluate(
             loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
             losses_total += loss.item()
             processed = base_model.postprocess(outputs, images, targets)
+            batch_predictions: List[dict] = []
             for pred, target in zip(processed, targets):
                 boxes = pred["boxes"].cpu()
                 scores = pred["scores"].cpu()
@@ -503,9 +524,24 @@ def evaluate(
                     coco_box = [x_min, y_min, x_max - x_min, y_max - y_min]
                     # coco_label = int(label_map.get(int(label), int(label)))
                     coco_label = int(label)
-                    predictions_all.append(
+                    batch_predictions.append(
                         {"image_id": image_id, "category_id": coco_label, "bbox": coco_box, "score": float(score)}
                     )
+
+            if distributed:
+                gathered_batches: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore[list-item]
+                dist.all_gather_object(gathered_batches, batch_predictions)
+                if rank == 0:
+                    merged_batch = [pred for sublist in gathered_batches for pred in sublist]
+                    predictions_all.extend(merged_batch)
+                    evaluate_predictions_with_logging(
+                        dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
+                    )
+            else:
+                predictions_all.extend(batch_predictions)
+                evaluate_predictions_with_logging(
+                    dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
+                )
 
     total_tensor = torch.tensor([losses_total], device=device)
     if distributed:
