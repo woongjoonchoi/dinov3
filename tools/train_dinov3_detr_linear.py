@@ -335,9 +335,12 @@ class SetCriterion(nn.Module):
         return losses
 
 
-def build_criterion(num_classes: int) -> Tuple[SetCriterion, Dict[str, float]]:
+def build_criterion(num_classes: int, num_decoder_layers: int) -> Tuple[SetCriterion, Dict[str, float]]:
     matcher = HungarianMatcher(cost_class=2, cost_bbox=5, cost_giou=2)
-    weight_dict = {"loss_ce": 1, "loss_bbox": 5, "loss_giou": 2}
+    weight_dict: Dict[str, float] = {"loss_ce": 1, "loss_bbox": 5, "loss_giou": 2}
+    if num_decoder_layers > 1:
+        for i in range(num_decoder_layers - 1):
+            weight_dict.update({f"loss_ce_{i}": 1, f"loss_bbox_{i}": 5, f"loss_giou_{i}": 2})
     losses = ["labels", "boxes", "cardinality"]
     criterion = SetCriterion(num_classes=num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=0.1, losses=losses)
     return criterion, weight_dict
@@ -396,7 +399,8 @@ def evaluate(
             targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
-            loss = sum(loss_dict[k] * 1.0 for k in loss_dict if k in criterion.weight_dict or k.startswith("loss"))
+            weight_dict = criterion.weight_dict
+            loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
             losses_total += loss.item()
             processed = base_model.postprocess(outputs, images, targets)
             for pred, target in zip(processed, targets):
@@ -450,7 +454,11 @@ def train_one_epoch(
         targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
         outputs = model(images)
         loss_dict = criterion(outputs, targets)
-        losses = sum(loss_dict[k] * criterion.weight_dict.get(k.split("_")[0], 1.0) for k in loss_dict if k.startswith("loss"))
+        losses = sum(
+            loss_dict[k] * criterion.weight_dict[k]
+            for k in loss_dict
+            if k in criterion.weight_dict
+        )
         optimizer.zero_grad()
         losses.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -595,7 +603,8 @@ def main() -> None:
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
-    criterion, weight_dict = build_criterion(num_classes=91)
+    num_decoder_layers = len(model.detector.transformer.decoder.layers)
+    criterion, weight_dict = build_criterion(num_classes=91, num_decoder_layers=num_decoder_layers)
     criterion.to(device)
 
     if args.distributed:
