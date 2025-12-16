@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -24,7 +25,6 @@ from torchvision.transforms.functional import (
 )
 from tqdm import tqdm
 
-import wandb
 from scipy.optimize import linear_sum_assignment
 
 from dinov3.hub.backbones import dinov3_vit7b16, dinov3_vitl16plus
@@ -32,6 +32,83 @@ from dinov3.eval.detection.config import DetectionHeadConfig
 from dinov3.eval.detection.models.detr import PostProcess, build_model
 from dinov3.eval.detection.models.position_encoding import PositionEncoding
 from dinov3.eval.detection.util import box_ops
+
+
+def make_wandb_run_name(args: argparse.Namespace) -> str:
+    prefix = getattr(args, "experiment_name", None) or "coco-detr"
+    parts = [
+        prefix,
+        "coco",
+        args.backbone_name,
+        f"{args.split}-{args.val_split}",
+    ]
+    if args.max_size is not None:
+        parts.append(f"res{args.max_size}")
+    parts.extend(
+        [
+            f"ep{args.epochs}",
+            f"bs{args.batch_size}",
+            f"lr{args.lr:g}",
+        ]
+    )
+    if args.weight_decay > 0:
+        parts.append(f"wd{args.weight_decay:g}")
+    seed = getattr(args, "seed", None)
+    if seed is not None:
+        parts.append(f"s{seed}")
+    return "_".join(parts)
+
+
+@dataclass
+class _RunMetadata:
+    num_classes: int
+    train_images: int
+    val_images: int
+    backbone_name: str
+    max_size: Optional[int]
+
+
+def _init_wandb(args: argparse.Namespace, meta: _RunMetadata):
+    if args.wandb_project is None:
+        return None
+
+    try:
+        import wandb
+        from wandb.errors import CommError
+    except ImportError:
+        print("wandb not installed; skipping logging.")
+        return None
+
+    try:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "dataset": "coco",
+                "train_split": args.split,
+                "val_split": args.val_split,
+                "num_classes": meta.num_classes,
+                "backbone_name": meta.backbone_name,
+                "max_size": meta.max_size,
+                "train_images": meta.train_images,
+                "val_images": meta.val_images,
+                "batch_size": args.batch_size,
+                "val_batch_size": args.val_batch_size,
+                "epochs": args.epochs,
+                "learning_rate": args.lr,
+                "weight_decay": args.weight_decay,
+                "score_threshold": args.score_threshold,
+            },
+            settings=wandb.Settings(
+                insecure_disable_ssl=True,
+            ),
+        )
+    except CommError as e:
+        print(f"[WARN] wandb init failed (network/SSL): {e}")
+        print("       → continuing WITHOUT wandb logging.")
+        return None
+
+    return wandb
 
 
 def _load_checkpoint(path: Path) -> dict:
@@ -445,7 +522,7 @@ def train_one_epoch(
     epoch: int,
     log_interval: int,
     global_step: int,
-    use_wandb: bool,
+    wandb: Any | None,
 ) -> int:
     model.train()
     criterion.train()
@@ -466,7 +543,7 @@ def train_one_epoch(
         )
         optimizer.step()
 
-        if global_step % log_interval == 0 and use_wandb:
+        if global_step % log_interval == 0 and wandb is not None:
             log_data = {"train/loss": losses.item()}
             for k, v in loss_dict.items():
                 if k.startswith("loss"):
@@ -481,6 +558,7 @@ def train_one_epoch(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train DINOv3 detector on COCO with frozen backbone.")
+    parser.add_argument("--experiment-name", type=str, default=None, help="Optional experiment name prefix for wandb run name.")
     parser.add_argument("--coco-root", required=True, help="Path to COCO dataset root (containing annotations/ and split folders).")
     parser.add_argument("--split", default="train2017", help="Image split to train (e.g., train2017).")
     parser.add_argument("--val-split", default="val2017", help="Image split to validate (e.g., val2017).")
@@ -519,6 +597,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", type=str, default=None, help="Weights & Biases project name.")
     parser.add_argument("--wandb-run-name", type=str, default=None, help="Weights & Biases run name.")
     parser.add_argument("--log-interval", type=int, default=10, help="Logging interval in steps.")
+    parser.add_argument("--seed", type=int, default=None, help="Optional random seed used for naming.")
     return parser.parse_args()
 
 
@@ -538,8 +617,6 @@ def main() -> None:
         device = torch.device(args.device)
         rank = 0
         world_size = 1
-
-    use_wandb = rank == 0 and args.wandb_project is not None
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -588,6 +665,9 @@ def main() -> None:
         prefetch_factor=args.prefetch_factor,
     )
 
+    if args.wandb_run_name is None:
+        args.wandb_run_name = make_wandb_run_name(args)
+
     model = _build_model_from_checkpoints(args, device)
 
     # Freeze backbone parameters
@@ -610,9 +690,19 @@ def main() -> None:
     if args.distributed:
         model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
 
+    num_classes_meta = getattr(model.detector, "num_classes", 91)
+    meta = _RunMetadata(
+        num_classes=num_classes_meta,
+        train_images=len(train_dataset),
+        val_images=len(val_dataset),
+        backbone_name=args.backbone_name,
+        max_size=args.max_size,
+    )
+
+    is_main_process = (not args.distributed) or rank == 0
+    wandb = _init_wandb(args, meta) if is_main_process else None
+
     global_step = 0
-    if use_wandb:
-        wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
 
     for epoch in range(1, args.epochs + 1):
         if train_sampler is not None:
@@ -626,7 +716,7 @@ def main() -> None:
             epoch=epoch,
             log_interval=args.log_interval,
             global_step=global_step,
-            use_wandb=use_wandb,
+            wandb=wandb,
         )
 
         if args.distributed:
@@ -639,7 +729,7 @@ def main() -> None:
             log_data = {"val/loss": val_loss}
             if metrics:
                 log_data.update(metrics)
-            if use_wandb:
+            if wandb is not None:
                 wandb.log(log_data, step=global_step)
             else:
                 print(log_data)
