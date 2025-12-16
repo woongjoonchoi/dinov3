@@ -83,16 +83,16 @@ def _build_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Mod
     """Build a backbone based on ``args.backbone_name`` with optional FP8 conversion."""
 
     backbone_name = args.backbone_name
-    apply_fp8 = backbone_name.endswith("-fp8")
+    apply_fp8 = bool(getattr(args, "fp8_enabled", False))
     args.fp8_enabled = apply_fp8
     args.fp8_filter = getattr(args, "fp8_filter", None)
 
-    if backbone_name in {"baseline1-1", "baseline1-1-fp8"}:
+    if backbone_name == "b1_1":
         backbone = DinoVisionTransformerWindowBaseline1_1(**args.model_kwargs)
         state_dict = _remap_window_block_keys_to_patch_only(
             backbone, _load_state_dict(args.backbone_checkpoint)
         )
-    elif backbone_name in {"baseline1-3", "baseline1-3-fp8"}:
+    elif backbone_name == "b1_3":
         backbone = LocalGlobalHybridVisionTransformer(**args.model_kwargs)
         state_dict = _load_state_dict(args.backbone_checkpoint)
     else:
@@ -402,13 +402,19 @@ def parse_args() -> argparse.Namespace:
         "--backbone-name",
         type=str,
         default=None,
-        help="Custom backbone name for local loading (e.g., baseline1-1, baseline1-1-fp8).",
+        help="Custom backbone name for local loading (e.g., b1_1, b1_3).",
     )
     parser.add_argument(
         "--backbone-checkpoint",
         type=str,
         default=None,
         help="Checkpoint path for the custom backbone used with --backbone-name.",
+    )
+    parser.add_argument(
+        "--fp8-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable FP8 conversion for the custom backbone when supported.",
     )
     parser.add_argument(
         "--model-kwargs",
