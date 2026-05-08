@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import json
-import os
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -678,11 +678,14 @@ def main() -> None:
             tqdm(dataloader, desc="Evaluating", total=len(dataloader)), start=1
         ):
             inputs = [img.to(device) for img in images]
-            # print(f"meta type : {type(metas)}")
-            # print(metas)
-            # exit()
-            outputs = model(inputs,metas)
-            # outputs = model(inputs)
+            outputs = model(inputs, metas)
+            # ── Smoke-test exit: first forward pass done ──────────────────────
+            if rank == 0:
+                print("✅ 1-Step Forward Pass Success!")
+            if args.distributed:
+                dist.destroy_process_group()
+            sys.exit(0)
+            # ─────────────────────────────────────────────────────────────────
             batch_predictions: List[dict] = []
             # print(outputs[0].keys())        # boxes, scores, labels?
             # print(outputs[0]["boxes"][:5])

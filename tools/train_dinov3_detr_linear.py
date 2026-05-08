@@ -57,6 +57,10 @@ def make_wandb_run_name(args: argparse.Namespace) -> str:
     seed = getattr(args, "seed", None)
     if seed is not None:
         parts.append(f"s{seed}")
+
+    load_detr_head = getattr(args, "detector_checkpoint", None)
+    if not load_detr_head:
+        parts.append("from-scratch")
     return "_".join(parts)
 
 
@@ -223,9 +227,11 @@ def _build_model_from_checkpoints(args: argparse.Namespace, device: torch.device
         config.layers_to_use = [m * backbone.n_blocks // 4 - 1 for m in range(1, 5)]
 
     detector = build_model(backbone, config)
+    print(f"detector checkpoint")
     if args.detector_checkpoint is not None:
         detector_state = _load_checkpoint(args.detector_checkpoint)
         detector.load_state_dict(detector_state, strict=False)
+        print(f"detector checkpoint load ")        
     detector.num_queries = detector.num_queries_one2one
     detector.transformer.two_stage_num_proposals = detector.num_queries
 
@@ -246,7 +252,8 @@ class DetectorWithPostProcess(nn.Module):
 
     def postprocess(self, outputs, samples: list[torch.Tensor], metas: List[dict]):
         sizes_tensor = torch.tensor([sample.shape[1:] for sample in samples], device=samples[0].device)
-        orig_sizes = torch.tensor([m["orig_size"] for m in metas], device=samples[0].device)
+        # orig_sizes = torch.tensor([m["orig_size"] for m in metas], device=samples[0].device)
+        orig_sizes = torch.stack([m["orig_size"] for m in metas])
         return self.postprocessor(outputs, target_sizes=sizes_tensor, original_target_sizes=orig_sizes)
 
 
@@ -505,6 +512,19 @@ def evaluate(
     with torch.no_grad():
         for iteration, (images, targets) in enumerate(tqdm(dataloader, desc="Validating", total=len(dataloader)), start=1):
             images = [img.to(device) for img in images]
+            # cloned_targets = targets.clone().detach()
+            # cloned_targets =[t.detach().cpu() for t in targets]
+            cloned_targets = [
+                {
+                    k: (v.detach().clone() if isinstance(v, torch.Tensor) else v)
+                    for k, v in t.items()
+                }
+                for t in targets
+            ]
+            # print(f"targets :{type(targets[0])}")
+            # print(f"targets 0 : {targets[0]}")
+            # # print(f"cloned_targets:{cloned_targets}")
+            # exit()
             targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
@@ -512,9 +532,12 @@ def evaluate(
             weight_dict = criterion.weight_dict
             loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
             losses_total += loss.item()
+            # print(f"type targets :{type(targets)}")
+            # print(f"targets :{targets[0]}")
             processed = base_model.postprocess(outputs, images, targets)
             batch_predictions: List[dict] = []
-            for pred, target in zip(processed, targets):
+            for pred, target in zip(processed, cloned_targets):
+            # for pred, target in zip(processed, targets):
                 boxes = pred["boxes"].cpu()
                 scores = pred["scores"].cpu()
                 labels = pred["labels"].cpu()
@@ -532,35 +555,23 @@ def evaluate(
                     #     {"image_id": image_id, "category_id": coco_label, "bbox": coco_box, "score": float(score)}
                     # )
 
-            if distributed:
-                gathered_batches: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore[list-item]
-                dist.all_gather_object(gathered_batches, batch_predictions)
-                if rank == 0:
-                    merged_batch = [pred for sublist in gathered_batches for pred in sublist]
-                    predictions_all.extend(merged_batch)
-                    evaluate_predictions_with_logging(
-                        dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
-                    )
-            else:
-                predictions_all.extend(batch_predictions)
-                evaluate_predictions_with_logging(
-                    dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
-                )
+            # if distributed:
+            #     gathered_batches: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore[list-item]
+            #     dist.all_gather_object(gathered_batches, batch_predictions)
+            #     if rank == 0:
+            #         merged_batch = [pred for sublist in gathered_batches for pred in sublist]
+            #         predictions_all.extend(merged_batch)
+            #         evaluate_predictions_with_logging(
+            #             dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
+            #         )
+            # else:
+            #     predictions_all.extend(batch_predictions)
+            #     evaluate_predictions_with_logging(
+            #         dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
+            #     )
+            predictions_all.extend(batch_predictions)
+            # break
 
-            if distributed:
-                gathered_batches: List[List[dict]] = [None for _ in range(world_size)]  # type: ignore[list-item]
-                dist.all_gather_object(gathered_batches, batch_predictions)
-                if rank == 0:
-                    merged_batch = [pred for sublist in gathered_batches for pred in sublist]
-                    predictions_all.extend(merged_batch)
-                    evaluate_predictions_with_logging(
-                        dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
-                    )
-            else:
-                predictions_all.extend(batch_predictions)
-                evaluate_predictions_with_logging(
-                    dataset.coco, predictions_all, iteration=iteration, require_nonempty=False
-                )
 
     total_tensor = torch.tensor([losses_total], device=device)
     if distributed:
@@ -621,7 +632,7 @@ def train_one_epoch(
                     log_data[f"train/lr_group_{i}"] = g["lr"]
             wandb.log(log_data, step=global_step)
         global_step += 1
-        return global_step
+        # return global_step
     return global_step
 
 
